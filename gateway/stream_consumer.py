@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from gateway.response_filter import is_gateway_silent_response
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -1148,6 +1149,9 @@ class GatewayStreamConsumer:
         if self.cfg.cursor:
             visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
         _visible_stripped = visible_without_cursor.strip()
+        if is_gateway_silent_response(_visible_stripped):
+            self._final_response_sent = True
+            return True  # internal no-send sentinel, not user-visible content
         if not _visible_stripped:
             return True  # cursor-only / whitespace-only update
         if not text.strip():

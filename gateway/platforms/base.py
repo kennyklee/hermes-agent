@@ -20,6 +20,7 @@ import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
+from gateway.response_filter import is_gateway_silent_response
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -3843,7 +3844,7 @@ class BasePlatformAdapter(ABC):
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
-                    if _text:
+                    if _text and not is_gateway_silent_response(_text):
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
@@ -3893,7 +3894,7 @@ class BasePlatformAdapter(ABC):
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
-                        if _text:
+                        if _text and not is_gateway_silent_response(_text):
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
@@ -4049,6 +4050,14 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if is_gateway_silent_response(response):
+                logger.info(
+                    "[%s] Suppressing user-visible gateway reply for %s because "
+                    "handler returned a silent response sentinel",
+                    self.name,
+                    event.source.chat_id,
+                )
+                response = None
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or

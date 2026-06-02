@@ -2,6 +2,7 @@
 
 from gateway.config import Platform
 from gateway.run import (
+    _is_gateway_silent_response,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -24,11 +25,34 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
 
 
 def test_non_telegram_status_is_unchanged():
-    """The Telegram quieting policy must not hide CLI/Discord diagnostics."""
+    """The gateway quieting policy must not hide CLI/Discord diagnostics."""
     message = "⏳ Retrying in 4.2s (attempt 1/3)..."
 
     assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message
     assert _prepare_gateway_status_message("local", "lifecycle", message) == message
+
+
+def test_slack_status_suppresses_retry_and_provider_noise():
+    """Slack should not receive raw retry/provider status chatter."""
+    noisy_messages = [
+        "⏳ Retrying in 4.2s (attempt 1/3)...",
+        "⚠️ Non-retryable error (HTTP None) — trying fallback...",
+        "❌ Non-retryable error (HTTP None): 'NoneType' object is not iterable",
+    ]
+
+    for message in noisy_messages:
+        assert _prepare_gateway_status_message(Platform.SLACK, "warn", message) is None
+
+
+def test_slack_final_response_sanitizes_raw_provider_errors():
+    """Final Slack replies should not expose raw provider exception bodies."""
+    raw = "❌ Non-retryable error (HTTP None): 'NoneType' object is not iterable"
+
+    sanitized = _sanitize_gateway_final_response(Platform.SLACK, raw)
+
+    assert "provider failed" in sanitized.lower()
+    assert "NoneType" not in sanitized
+    assert "HTTP None" not in sanitized
 
 
 def test_telegram_status_sanitizes_raw_provider_security_errors():
@@ -81,3 +105,24 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_gateway_silent_response_detects_no_response_sentinel():
+    """Internal no-send sentinels must not leak as visible chat messages."""
+    silent_variants = [
+        "[NO_RESPONSE]",
+        "NO_RESPONSE",
+        "`[NO_RESPONSE]`",
+        "```[NO_RESPONSE]```",
+        "[no_response].",
+        "[SILENT]",
+    ]
+
+    for variant in silent_variants:
+        assert _is_gateway_silent_response(variant)
+
+
+def test_gateway_silent_response_does_not_hide_real_content():
+    """Only a standalone sentinel is suppressed; explanations still send."""
+    assert not _is_gateway_silent_response("Expected behavior: do not show [NO_RESPONSE].")
+    assert not _is_gateway_silent_response("I will stay silent now.")

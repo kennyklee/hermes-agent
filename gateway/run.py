@@ -55,6 +55,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.response_filter import is_gateway_silent_response as _shared_is_gateway_silent_response
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -67,8 +68,8 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
-_TELEGRAM_NOISY_STATUS_RE = re.compile(
-    r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
+_GATEWAY_NOISY_STATUS_RE = re.compile(
+    r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
@@ -85,6 +86,9 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+
+_GATEWAY_QUIET_STATUS_PLATFORMS = {"slack", "telegram"}
+_GATEWAY_SANITIZE_FINAL_PLATFORMS = {"slack", "telegram"}
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
@@ -138,6 +142,17 @@ _GATEWAY_SECRET_PATTERNS = (
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _is_gateway_silent_response(text: Any) -> bool:
+    """Return True when model output is only an internal no-send sentinel.
+
+    Group-chat agents can use a sentinel like ``[NO_RESPONSE]`` to mean
+    "intentionally stay silent".  That marker is control flow, not user-facing
+    content, so the gateway must suppress delivery if it reaches the final
+    response path.
+    """
+    return _shared_is_gateway_silent_response(text)
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -288,13 +303,12 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to high-noise chats.
 
-    Telegram is Bob's mobile inbox, so it should receive concise, safe provider
-    failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
+    Human-facing gateway chats should receive concise, safe provider failure
+    categories instead of raw HTTP bodies, request IDs, or policy text.
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_platform_value(platform) not in _GATEWAY_SANITIZE_FINAL_PLATFORMS:
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -308,11 +322,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+    if platform_value not in _GATEWAY_QUIET_STATUS_PLATFORMS:
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
+    if _GATEWAY_NOISY_STATUS_RE.search(text):
+        return None
+    if platform_value == "slack" and _looks_like_gateway_provider_error(text):
         return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
@@ -4655,6 +4672,8 @@ class GatewayRunner:
                 )
             finally:
                 _clear_planned_restart_notification()
+        else:
+            await self._send_configured_startup_notifications()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -9368,6 +9387,15 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+
+            if _is_gateway_silent_response(response):
+                logger.info(
+                    "Suppressing user-visible gateway reply for %s/%s because "
+                    "agent returned a silent response sentinel",
+                    _platform_name,
+                    source.chat_id or "unknown",
+                )
+                response = ""
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -15267,6 +15295,7 @@ class GatewayRunner:
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        message: Optional[str] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify configured home channels that the gateway is back online.
 
@@ -15276,7 +15305,7 @@ class GatewayRunner:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = message or "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
@@ -15329,6 +15358,97 @@ class GatewayRunner:
                     exc,
                 )
 
+        return delivered
+
+    def _startup_notifications_config(self) -> tuple[bool, str, float, float]:
+        """Return configured proactive startup notification settings.
+
+        Restart-originated lifecycle messages already have their own marker
+        flow. This opt-in block covers ordinary process starts/crash recovery
+        and is rate-limited so service crash loops do not spam home channels.
+        A short delay lets restart/--replace churn settle so the final stable
+        process sends the notification instead of a process that is about to die.
+        """
+        cfg = _load_gateway_runtime_config()
+        block = cfg_get(cfg, "gateway", "startup_notifications", default={})
+        if block is None:
+            block = {}
+        if not isinstance(block, dict):
+            enabled = is_truthy_value(block, default=False)
+            block = {}
+        else:
+            enabled = is_truthy_value(block.get("enabled"), default=False)
+
+        message = str(
+            block.get("message")
+            or "✅ Hermes is back online and monitoring messages again."
+        ).strip()
+        if not message:
+            message = "✅ Hermes is back online."
+
+        try:
+            min_interval = float(block.get("min_interval_seconds", 300))
+        except (TypeError, ValueError):
+            min_interval = 300.0
+        if min_interval < 0:
+            min_interval = 0.0
+
+        try:
+            startup_delay = float(block.get("startup_delay_seconds", 5))
+        except (TypeError, ValueError):
+            startup_delay = 5.0
+        if startup_delay < 0:
+            startup_delay = 0.0
+
+        return enabled, message, min_interval, startup_delay
+
+    def _startup_notification_rate_limited(self, min_interval_seconds: float) -> bool:
+        if min_interval_seconds <= 0:
+            return False
+        path = _hermes_home / ".startup_notification_sent.json"
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+            last_sent_at = float(data.get("sent_at", 0) or 0)
+        except Exception:
+            last_sent_at = 0.0
+        return (time.time() - last_sent_at) < min_interval_seconds
+
+    def _mark_startup_notification_sent(self) -> None:
+        path = _hermes_home / ".startup_notification_sent.json"
+        try:
+            atomic_json_write(path, {"sent_at": time.time()}, indent=None)
+        except Exception as exc:
+            logger.debug("Failed to record startup notification timestamp: %s", exc)
+
+    async def _send_configured_startup_notifications(self) -> set[tuple[str, str, Optional[str]]]:
+        """Send opt-in proactive startup notifications to home channels."""
+        enabled, message, min_interval, startup_delay = self._startup_notifications_config()
+        if not enabled:
+            return set()
+        if self._startup_notification_rate_limited(min_interval):
+            logger.info(
+                "Configured startup notification suppressed by %.0fs rate limit",
+                min_interval,
+            )
+            return set()
+        if startup_delay > 0:
+            logger.info(
+                "Delaying configured startup notification by %.1fs to let restart churn settle",
+                startup_delay,
+            )
+            await asyncio.sleep(startup_delay)
+            if self._startup_notification_rate_limited(min_interval):
+                logger.info(
+                    "Configured startup notification suppressed by %.0fs rate limit after delay",
+                    min_interval,
+                )
+                return set()
+
+        delivered = await self._send_home_channel_startup_notifications(
+            message=message,
+        )
+        if delivered:
+            self._mark_startup_notification_sent()
         return delivered
 
     def _set_session_env(self, context: SessionContext) -> list:

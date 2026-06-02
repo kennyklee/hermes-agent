@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -358,3 +360,76 @@ async def test_gateway_stop_kills_tool_subprocesses_on_graceful_path(monkeypatch
 
     # Only the final catch-all fires on the graceful path.
     assert kill_count == 1
+
+
+@pytest.mark.asyncio
+async def test_configured_startup_notification_sends_to_home_channel(monkeypatch, tmp_path):
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="123456",
+        name="Home",
+    )
+
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {
+            "gateway": {
+                "startup_notifications": {
+                    "enabled": True,
+                    "message": "Aisha is back online.",
+                    "min_interval_seconds": 300,
+                    "startup_delay_seconds": 0,
+                }
+            }
+        },
+    )
+
+    delivered = await runner._send_configured_startup_notifications()
+
+    assert delivered == {("telegram", "123456", None)}
+    assert adapter.sent == ["Aisha is back online."]
+    marker = json.loads((tmp_path / ".startup_notification_sent.json").read_text())
+    assert marker["sent_at"] > 0
+
+
+@pytest.mark.asyncio
+async def test_configured_startup_notification_respects_rate_limit(monkeypatch, tmp_path):
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="123456",
+        name="Home",
+    )
+
+    (tmp_path / ".startup_notification_sent.json").write_text(
+        json.dumps({"sent_at": time.time()}),
+        encoding="utf-8",
+    )
+
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {
+            "gateway": {
+                "startup_notifications": {
+                    "enabled": True,
+                    "message": "Aisha is back online.",
+                    "min_interval_seconds": 300,
+                    "startup_delay_seconds": 0,
+                }
+            }
+        },
+    )
+
+    delivered = await runner._send_configured_startup_notifications()
+
+    assert delivered == set()
+    assert adapter.sent == []
