@@ -1331,10 +1331,15 @@ class MCPServerTask:
                             timeout=30.0,
                         )
                     except Exception as exc:
-                        logger.warning(
+                        # Keepalive failures usually mean an idle remote MCP
+                        # stream went stale. Reconnecting is expected recovery,
+                        # so keep this below WARNING; real connection failures
+                        # and exhausted reconnect attempts are still warned in
+                        # the outer run loop.
+                        logger.info(
                             "MCP server '%s' keepalive failed, "
-                            "triggering reconnect: %s",
-                            self.name, exc,
+                            "triggering reconnect: %s: %s",
+                            self.name, type(exc).__name__, exc,
                         )
                         self._reconnect_event.set()
                         break
