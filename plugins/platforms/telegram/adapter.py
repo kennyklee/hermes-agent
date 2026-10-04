@@ -164,6 +164,7 @@ try:
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
+        TypeHandler,
         filters,
     )
     from telegram.constants import ParseMode, ChatType
@@ -181,6 +182,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    TypeHandler = Any
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -252,7 +254,7 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler, TypeHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -272,6 +274,7 @@ def check_telegram_requirements() -> bool:
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
+            TypeHandler as _TH,
             ContextTypes as _CT, filters as _filters,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
@@ -288,6 +291,7 @@ def check_telegram_requirements() -> bool:
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
     TelegramMessageHandler = _MH
+    TypeHandler = _TH
     ContextTypes = _CT
     filters = _filters
     ParseMode = _PM
@@ -3095,6 +3099,15 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            # Bot API rich_message-only updates do not match filters.TEXT, so
+            # observe every update at low priority and route only that fallback
+            # shape into the normal text batching path. Normal text/caption
+            # messages return immediately and are handled by the existing
+            # MessageHandlers below.
+            self._app.add_handler(TypeHandler(
+                Update,
+                self._observe_raw_update,
+            ), group=-100)
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -7350,6 +7363,97 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _observe_raw_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route textless Telegram rich_message updates into text handling.
+
+        Telegram Bot API rich-message inbound payloads may have no ``text`` or
+        ``caption``, which means they do not match PTB's ``filters.TEXT`` and
+        bypass the normal text handler entirely. Keep this observer silent for
+        ordinary text/caption updates; only metadata for the rich fallback is
+        logged, never the private message body.
+        """
+        try:
+            msg = self._effective_update_message(update)
+            if not msg:
+                return
+            if getattr(msg, "text", None) or getattr(msg, "caption", None):
+                return
+
+            rich_text = self._extract_rich_message_text(msg)
+            if not rich_text:
+                return
+
+            logger.info(
+                "[Telegram] Rich-message fallback: update_id=%s message_id=%s "
+                "rich_text_len=%d chars=%d newlines=%d",
+                getattr(update, "update_id", None),
+                getattr(msg, "message_id", None),
+                len(rich_text),
+                len(rich_text),
+                rich_text.count("\n"),
+            )
+            await self._handle_rich_text_message(update, msg, rich_text)
+        except Exception:
+            logger.debug("[Telegram] Rich-message fallback observer failed", exc_info=True)
+
+    class _RichTextMessageProxy:
+        """Message duck-type that supplies text without mutating PTB Message."""
+
+        def __init__(self, message: Message, text: str):
+            self._message = message
+            self.text = text
+            self.caption = getattr(message, "caption", None)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._message, name)
+
+        def to_dict(self) -> Any:
+            to_dict = getattr(self._message, "to_dict", None)
+            if not callable(to_dict):
+                return {}
+            data = to_dict()
+            if isinstance(data, dict):
+                data = dict(data)
+                data["text"] = self.text
+            return data
+
+    def _rich_text_message_proxy(self, message: Message, rich_text: str) -> Message:
+        return self._RichTextMessageProxy(message, rich_text)  # type: ignore[return-value]
+
+    async def _handle_rich_text_message(self, update: Update, msg: Message, rich_text: str) -> None:
+        """Handle a textless Bot API rich_message as a normal text message."""
+        if not rich_text:
+            return
+
+        text_msg = self._rich_text_message_proxy(msg, rich_text)
+
+        # Mirror _handle_text_message's security and routing order so normal
+        # auth, group mention/topic rules, observed-context behavior, reply media
+        # caching, attribution, and text batching all stay in one path.
+        if not self._is_user_authorized_from_message(text_msg):
+            logger.warning(
+                "[Telegram] Blocked unauthorized rich-message user %s in chat %s",
+                getattr(getattr(text_msg, "from_user", None), "id", None),
+                getattr(getattr(text_msg, "chat", None), "id", None),
+            )
+            return
+        if not self._should_process_message(text_msg):
+            if self._should_observe_unmentioned_group_message(text_msg):
+                event = self._build_message_event(text_msg, MessageType.TEXT, update_id=update.update_id)
+                event.text = rich_text
+                event = self._apply_telegram_group_observe_attribution(event)
+                self._observe_unmentioned_group_message(
+                    text_msg, MessageType.TEXT, update_id=update.update_id, event=event
+                )
+            return
+        await self._ensure_forum_commands(text_msg)
+
+        event = self._build_message_event(text_msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = self._clean_bot_trigger_text(rich_text)
+        await self._cache_replied_media(text_msg, event)
+        event = self._apply_telegram_group_observe_attribution(event)
+        self._enqueue_text_event(event)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -8151,19 +8255,42 @@ class TelegramAdapter(BasePlatformAdapter):
 
             text = cls._flatten_rich_inline_text(block.get("text"))
             if text:
-                lines.extend(text.splitlines())
+                text_lines = text.splitlines()
+                if len(text_lines) <= 1:
+                    # Telegram's inbound rich_message payload can coalesce a
+                    # pasted numbered list into one text block while preserving
+                    # literal markers ("1. … 2. … 3. …"). Restore line
+                    # breaks before later markers so the model sees the user's
+                    # list/instruction structure.
+                    text_lines = re.sub(
+                        r"(?<!^)(?<!\n)\s+(?=\d+\.\s+\S)",
+                        "\n",
+                        text,
+                    ).splitlines()
+                lines.extend(text_lines)
 
         return "\n".join(line.rstrip() for line in lines if line)
 
     @classmethod
-    def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
-        """Return plaintext echoed by Telegram's rich_message reply payload."""
+    def _extract_rich_message_text(cls, message: Any) -> Optional[str]:
+        """Return plaintext from a Telegram Bot API ``rich_message`` payload.
+
+        Outbound reply echoes usually store it in ``message.api_kwargs``;
+        inbound updates may expose it only through ``message.to_dict()``.
+        """
         try:
-            api_kwargs = getattr(reply_to_message, "api_kwargs", None)
+            rich_message = None
+            api_kwargs = getattr(message, "api_kwargs", None)
             getter = getattr(api_kwargs, "get", None)
-            if not callable(getter):
-                return None
-            rich_message = getter("rich_message")
+            if callable(getter):
+                rich_message = getter("rich_message")
+
+            if rich_message is None and hasattr(message, "to_dict"):
+                msg_dict = message.to_dict()
+                dict_getter = getattr(msg_dict, "get", None)
+                if callable(dict_getter):
+                    rich_message = dict_getter("rich_message")
+
             rich_getter = getattr(rich_message, "get", None)
             if not callable(rich_getter):
                 return None
@@ -8171,6 +8298,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return text or None
         except Exception:
             return None
+
+    @classmethod
+    def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
+        """Return plaintext echoed by Telegram's rich_message reply payload."""
+        return cls._extract_rich_message_text(reply_to_message)
 
     def _build_message_event(
         self,

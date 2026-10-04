@@ -1198,6 +1198,125 @@ async def test_rich_reply_native_blocks_support_mappingproxy_like_api_kwargs(mon
     assert event.reply_to_text == "Status\n- done"
 
 
+# --------------------------------------------------------------------------
+# Inbound rich_message fallback: Telegram Bot API rich-message payloads can
+# arrive without .text/.caption. They must still become normal text events.
+# --------------------------------------------------------------------------
+
+
+def _inbound_rich_message(*, rich_message, text=None, caption=None):
+    """Build a minimal inbound Telegram Message carrying Bot API rich_message."""
+
+    class RichMessage(SimpleNamespace):
+        def to_dict(self):
+            data = {
+                "message_id": self.message_id,
+                "chat": {"id": self.chat.id, "type": self.chat.type},
+                "from": {"id": self.from_user.id, "is_bot": self.from_user.is_bot},
+            }
+            if self.text is not None:
+                data["text"] = self.text
+            if self.caption is not None:
+                data["caption"] = self.caption
+            if rich_message is not None:
+                data["rich_message"] = rich_message
+            return data
+
+    return RichMessage(
+        message_id=999,
+        chat=SimpleNamespace(id=12345, type="private", title=None, full_name="U"),
+        from_user=SimpleNamespace(
+            id=42, username="u", first_name="U", last_name=None,
+            full_name="U", is_bot=False,
+        ),
+        text=text,
+        caption=caption,
+        reply_to_message=None,
+        quote=None,
+        message_thread_id=None,
+        is_topic_message=False,
+        entities=[],
+        date=None,
+    )
+
+
+def _inbound_update(message):
+    class RichUpdate(SimpleNamespace):
+        def to_dict(self):
+            return {"update_id": self.update_id, "message": self.message.to_dict()}
+
+    return RichUpdate(update_id=4242, message=message, effective_message=message)
+
+
+def test_extract_rich_message_text_reads_inbound_payload_from_to_dict():
+    msg = _inbound_rich_message(
+        rich_message={
+            "blocks": [
+                {"type": "paragraph", "text": ["Hello ", {"type": "bold", "text": "world"}]},
+                {"type": "pre", "text": "Line 2"},
+            ]
+        }
+    )
+
+    assert TelegramAdapter._extract_rich_message_text(msg) == "Hello world\nLine 2"
+
+
+def test_flatten_rich_blocks_restores_numbered_list_breaks_from_single_text_block():
+    collapsed = (
+        "1. Fix now — meaningful impact or broken capability "
+        "2. Worth improving — likely to produce better results "
+        "3. Optional — useful..."
+    )
+
+    assert TelegramAdapter._flatten_rich_blocks(
+        [{"type": "paragraph", "text": collapsed}]
+    ) == (
+        "1. Fix now — meaningful impact or broken capability\n"
+        "2. Worth improving — likely to produce better results\n"
+        "3. Optional — useful..."
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_rich_message_without_text_is_enqueued_as_text():
+    adapter = _make_adapter()
+    adapter._bot.username = "fake_bot"
+    adapter._bot.id = 1000
+    adapter._is_user_authorized_from_message = MagicMock(return_value=True)
+    adapter._should_process_message = MagicMock(return_value=True)
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._cache_replied_media = AsyncMock()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._apply_telegram_group_observe_attribution = MagicMock(side_effect=lambda event: event)
+
+    msg = _inbound_rich_message(
+        rich_message={
+            "blocks": [{"type": "paragraph", "text": "Rich-only inbound text"}]
+        }
+    )
+
+    await adapter._observe_raw_update(_inbound_update(msg), None)
+
+    adapter._enqueue_text_event.assert_called_once()
+    event = adapter._enqueue_text_event.call_args.args[0]
+    assert event.text == "Rich-only inbound text"
+    assert event.message_type.name == "TEXT"
+
+
+@pytest.mark.asyncio
+async def test_inbound_rich_observer_ignores_normal_text_messages():
+    adapter = _make_adapter()
+    adapter._handle_rich_text_message = AsyncMock()
+    msg = _inbound_rich_message(
+        text="normal text wins",
+        rich_message={"blocks": [{"type": "paragraph", "text": "ignored"}]},
+    )
+
+    await adapter._observe_raw_update(_inbound_update(msg), None)
+
+    adapter._handle_rich_text_message.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_try_edit_rich_records_streamed_final_for_reply_recovery(monkeypatch, tmp_path):
     """A streamed final finalized via editMessageText must be indexed too.
