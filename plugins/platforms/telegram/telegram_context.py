@@ -5,10 +5,21 @@ must be stable for the life of a session (username only — never a per-message 
 """
 
 from typing import TYPE_CHECKING, Optional
+from gateway.platforms._shared import extra_or_secret
 
 if TYPE_CHECKING:
     from telegram import Message
     from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+def mentions_only_peer_suppressed(adapter: "TelegramAdapter", message: "Message") -> bool:
+    """Mentions-only peers cannot wake via reply chains or leak status noise into context."""
+    mode = extra_or_secret(adapter.config.extra, "allow_bots", "TELEGRAM_ALLOW_BOTS", "none")
+    return (
+        str(mode).lower().strip() == "mentions"
+        and adapter._sender_is_other_bot(message)
+        and not adapter._message_mentions_bot(message)
+    )
 
 
 def mentions_other_participants(adapter: "TelegramAdapter", message: "Message") -> bool:
@@ -27,6 +38,23 @@ def mentions_other_participants(adapter: "TelegramAdapter", message: "Message") 
                 if user is not None and getattr(user, "id", None) != bot_id:
                     return True
     return False
+
+
+def reply_expected(adapter: "TelegramAdapter", message: "Message") -> Optional[bool]:
+    """Admission is not an obligation to answer ambient group chatter.
+
+    Peers must address us in the current message; human replies and configured
+    wake words remain directed requests. DMs retain the visible failure fallback.
+    """
+    if not adapter._is_group_chat(message):
+        return True
+    if not getattr(adapter, "_bot", None):
+        return None  # No identity: retain the gateway's unknown-address fallback.
+    if adapter._message_mentions_bot(message):
+        return True
+    if adapter._sender_is_other_bot(message):
+        return False
+    return adapter._is_reply_to_bot(message) or adapter._message_matches_mention_patterns(message)
 
 
 def group_trigger_text(adapter: "TelegramAdapter", message: "Message", text: Optional[str]) -> Optional[str]:
