@@ -34,7 +34,7 @@ def test_mentions_mode_requires_current_peer_address(monkeypatch, scope, require
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_bot,address,expected", [
-    (True, "reply", False), (True, "plain", False), (True, "mention", True),
+    (True, "reply", False), (True, "plain", False), (True, "mention", False),
     (False, "reply", True), (False, "plain", False), (False, "mention", True),
     (False, "dm", True), (False, "wake", True), (False, "unknown", None),
 ])
