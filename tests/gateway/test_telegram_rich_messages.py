@@ -13,7 +13,7 @@ The ``telegram`` package is mocked by ``tests/gateway/conftest.py``
 import asyncio
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -832,3 +832,352 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     )
     assert event.reply_to_message_id == "678"
     assert event.reply_to_text == "Your morning briefing: CI is green."
+
+
+# --------------------------------------------------------------------------
+# Inbound rich_message fallback: Bot API 10.1 updates can carry user text only
+# in rich_message, which PTB's normal TEXT filter does not currently dispatch.
+# --------------------------------------------------------------------------
+
+
+class _MappingLike:
+    """Small non-dict mapping stand-in for PTB's api_kwargs container."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def _inbound_rich_message(*, rich_message=None, api_kwargs=None, **overrides):
+    values = {
+        "message_id": 321,
+        "text": None,
+        "caption": None,
+        "rich_message": rich_message,
+        "api_kwargs": api_kwargs,
+        "chat": SimpleNamespace(
+            id=12345, type="private", title=None, full_name="User", is_forum=False,
+        ),
+        "from_user": SimpleNamespace(
+            id=42, username="u", first_name="U", last_name=None,
+            full_name="User", is_bot=False,
+        ),
+        "reply_to_message": None,
+        "message_thread_id": None,
+        "is_topic_message": False,
+        "entities": [],
+        "date": None,
+        "photo": None,
+        "video": None,
+        "audio": None,
+        "voice": None,
+        "document": None,
+        "sticker": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _rich_update(message, *, update_id=987):
+    return SimpleNamespace(
+        update_id=update_id,
+        effective_message=message,
+        message=message,
+    )
+
+
+def _instrument_inbound_text_path(adapter):
+    event = SimpleNamespace(text="")
+    adapter._is_user_authorized_from_message = MagicMock(return_value=True)
+    adapter._should_process_message = MagicMock(return_value=True)
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._build_message_event = MagicMock(return_value=event)
+    adapter._clean_bot_trigger_text = MagicMock(side_effect=lambda text: text)
+    adapter._cache_replied_media = AsyncMock()
+    adapter._apply_telegram_group_observe_attribution = MagicMock(
+        side_effect=lambda inbound: inbound
+    )
+    adapter._enqueue_text_event = MagicMock()
+    return event
+
+
+@pytest.mark.asyncio
+async def test_inbound_native_rich_message_uses_full_text_pipeline_and_restores_numbered_lines(caplog):
+    adapter = _make_adapter()
+    event = _instrument_inbound_text_path(adapter)
+    private_text = "PRIVATE_SENTINEL"
+    message = _inbound_rich_message(
+        rich_message=SimpleNamespace(
+            blocks=[
+                {
+                    "type": "paragraph",
+                    "text": f"1. Fix now {private_text} 2. Worth improving 3. Optional",
+                }
+            ]
+        )
+    )
+
+    with caplog.at_level(logging.INFO):
+        await adapter._handle_rich_message_update(
+            _rich_update(message), SimpleNamespace()
+        )
+
+    assert event.text == (
+        f"1. Fix now {private_text}\n2. Worth improving\n3. Optional"
+    )
+    adapter._is_user_authorized_from_message.assert_called_once_with(message)
+    should_process = getattr(adapter, "_should_process_message")
+    should_process.assert_called_once()
+    routed_message = should_process.call_args.args[0]
+    assert routed_message.text == event.text
+    assert routed_message.chat is message.chat
+    assert routed_message.from_user is message.from_user
+    adapter._ensure_forum_commands.assert_awaited_once_with(message)
+    adapter._build_message_event.assert_called_once_with(message, ANY, update_id=987)
+    adapter._cache_replied_media.assert_awaited_once_with(message, event)
+    adapter._apply_telegram_group_observe_attribution.assert_called_once_with(event)
+    adapter._enqueue_text_event.assert_called_once_with(event)
+    assert "update_id=987" in caplog.text
+    assert "message_id=321" in caplog.text
+    assert f"chars={len(event.text)}" in caplog.text
+    assert "newlines=2" in caplog.text
+    assert private_text not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_inbound_rich_message_reads_mapping_like_api_kwargs():
+    adapter = _make_adapter()
+    event = _instrument_inbound_text_path(adapter)
+    message = _inbound_rich_message(
+        api_kwargs=_MappingLike(
+            {
+                "rich_message": _MappingLike(
+                    {"blocks": [{"type": "paragraph", "text": "From api kwargs"}]}
+                )
+            }
+        )
+    )
+
+    await adapter._handle_rich_message_update(_rich_update(message), SimpleNamespace())
+
+    assert event.text == "From api kwargs"
+    adapter._enqueue_text_event.assert_called_once_with(event)
+
+
+def test_inbound_rich_message_supports_native_nodes_and_tuple_collections():
+    message = _inbound_rich_message(
+        rich_message=SimpleNamespace(
+            blocks=(
+                SimpleNamespace(
+                    type="paragraph",
+                    text=(SimpleNamespace(text="Native "), SimpleNamespace(text="blocks")),
+                ),
+            )
+        )
+    )
+
+    assert TelegramAdapter._extract_inbound_rich_text(message) == "Native blocks"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "Intro\n1. Fix now 2. Worth improving 3. Optional",
+            "Intro\n1. Fix now\n2. Worth improving\n3. Optional",
+        ),
+        (
+            "1. Meet on Jan 2. Then send notes",
+            "1. Meet on Jan 2. Then send notes",
+        ),
+        (
+            "1. First item 2. Second item 3. See section 42. for details",
+            "1. First item\n2. Second item\n3. See section 42. for details",
+        ),
+    ],
+)
+def test_inbound_rich_numbered_list_normalization_is_conservative(raw, expected):
+    message = _inbound_rich_message(
+        rich_message={"blocks": [{"type": "paragraph", "text": raw}]}
+    )
+
+    assert TelegramAdapter._extract_inbound_rich_text(message) == expected
+
+
+@pytest.fixture
+def isolated_inbound_routing(monkeypatch):
+    # Upstream now gives scoped/env gates precedence over extra; never inherit
+    # the developer gateway's live allowlists or mention policy in these tests.
+    import os
+    for key in tuple(os.environ):
+        if key.startswith("TELEGRAM_"):
+            monkeypatch.delenv(key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "expected", "with_entities"), [
+    ("@hermes_bot please audit this", "please audit this", False),
+    ("@hermes_bot please audit this", "please audit this", True),
+    ("@hermes_bot @other_bot please audit this", "@hermes_bot @other_bot please audit this", True),
+])
+async def test_inbound_rich_group_mention_passes_normal_group_gate(isolated_inbound_routing, text, expected, with_entities):
+    adapter = _make_adapter(
+        {
+            "require_mention": True,
+            "allowed_chats": [],
+            "group_allowed_chats": [],
+            "allowed_topics": [],
+        }
+    )
+    bot = adapter._bot
+    assert bot is not None
+    bot.id = 999
+    bot.username = "hermes_bot"
+    event = SimpleNamespace(text="")
+    adapter._is_user_authorized_from_message = MagicMock(return_value=True)
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._build_message_event = MagicMock(return_value=event)
+    adapter._cache_replied_media = AsyncMock()
+    adapter._apply_telegram_group_observe_attribution = MagicMock(
+        side_effect=lambda inbound: inbound
+    )
+    adapter._enqueue_text_event = MagicMock()
+    message = _inbound_rich_message(
+        rich_message=SimpleNamespace(
+            blocks=[{"type": "paragraph", "text": text}]
+        ),
+        chat=SimpleNamespace(
+            id=-100, type="group", title="Test Group", full_name=None, is_forum=False,
+        ),
+        entities=[
+            SimpleNamespace(type="mention", offset=text.index(handle), length=len(handle))
+            for handle in ("@hermes_bot", "@other_bot") if with_entities and handle in text
+        ],
+        caption_entities=[],
+    )
+
+    await adapter._handle_rich_message_update(_rich_update(message), SimpleNamespace())
+
+    assert event.text == expected
+    adapter._enqueue_text_event.assert_called_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_inbound_unmentioned_rich_group_observation_keeps_recovered_text(isolated_inbound_routing):
+    adapter = _make_adapter(
+        {
+            "require_mention": True,
+            "observe_unmentioned_group_messages": True,
+            "allowed_chats": ["-100"],
+            "group_allowed_chats": ["-100"],
+            "allowed_topics": [],
+        }
+    )
+    bot = adapter._bot
+    assert bot is not None
+    bot.id = 999
+    bot.username = "hermes_bot"
+    observed_event = SimpleNamespace(text="")
+    adapter._is_user_authorized_from_message = MagicMock(return_value=True)
+    adapter._build_message_event = MagicMock(return_value=observed_event)
+    adapter._observe_unmentioned_group_message = MagicMock()
+    adapter._enqueue_text_event = MagicMock()
+    message = _inbound_rich_message(
+        rich_message=SimpleNamespace(
+            blocks=[{"type": "paragraph", "text": "unmentioned rich context"}]
+        ),
+        chat=SimpleNamespace(
+            id=-100, type="group", title="Test Group", full_name=None, is_forum=False,
+        ),
+        entities=[],
+        caption_entities=[],
+    )
+
+    await adapter._handle_rich_message_update(_rich_update(message), SimpleNamespace())
+
+    adapter._observe_unmentioned_group_message.assert_called_once()
+    call = adapter._observe_unmentioned_group_message.call_args
+    assert call.kwargs["event"].text == "unmentioned rich context"
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"text": "ordinary text"},
+        {"caption": "ordinary caption"},
+        {"photo": [SimpleNamespace(file_id="photo")]},
+        *[{field: SimpleNamespace(file_id=field)} for field in (
+            "video", "audio", "voice", "document", "sticker", "animation", "video_note",
+        )],
+        {"location": SimpleNamespace(latitude=47.6, longitude=-122.3)},
+        {"venue": SimpleNamespace(title="Test venue")},
+    ],
+)
+async def test_inbound_rich_fallback_immediately_ignores_normal_or_media_updates(overrides):
+    adapter = _make_adapter()
+    _instrument_inbound_text_path(adapter)
+    message = _inbound_rich_message(
+        rich_message=SimpleNamespace(
+            blocks=[{"type": "paragraph", "text": "must not duplicate"}]
+        ),
+        **overrides,
+    )
+
+    await adapter._handle_rich_message_update(_rich_update(message), SimpleNamespace())
+
+    adapter._is_user_authorized_from_message.assert_not_called()
+    adapter._build_message_event.assert_not_called()
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_inbound_rich_unauthorized_user_never_reaches_routing_or_storage():
+    adapter = _make_adapter()
+    _instrument_inbound_text_path(adapter)
+    adapter._is_user_authorized_from_message.return_value = False
+    adapter._observe_unmentioned_group_message = MagicMock()
+    message = _inbound_rich_message(
+        rich_message={"blocks": [{"type": "paragraph", "text": "private denied text"}]},
+    )
+    await adapter._handle_rich_message_update(_rich_update(message), SimpleNamespace())
+    adapter._should_process_message.assert_not_called()
+    adapter._build_message_event.assert_not_called()
+    adapter._observe_unmentioned_group_message.assert_not_called()
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rich_message", [None, {}, {"blocks": []}, {"blocks": [{"text": "  "}]}])
+async def test_inbound_empty_rich_payload_is_ignored(rich_message):
+    adapter = _make_adapter()
+    _instrument_inbound_text_path(adapter)
+    message = _inbound_rich_message(rich_message=rich_message)
+    await adapter._handle_rich_message_update(_rich_update(message), SimpleNamespace())
+    adapter._is_user_authorized_from_message.assert_not_called()
+    adapter._enqueue_text_event.assert_not_called()
+
+
+def test_registers_inbound_rich_fallback_before_normal_handlers(monkeypatch):
+    import plugins.platforms.telegram.adapter as telegram_adapter
+
+    adapter = _make_adapter()
+    app = MagicMock()
+    sentinel = object()
+    monkeypatch.setattr(
+        telegram_adapter,
+        "TypeHandler",
+        lambda update_type, callback: sentinel
+        if callback == adapter._handle_rich_message_update
+        else (update_type, callback),
+    )
+
+    adapter._register_handlers(app)
+
+    assert any(
+        call.args == (sentinel,) and call.kwargs == {"group": -100}
+        for call in app.add_handler.call_args_list
+    )

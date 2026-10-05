@@ -510,6 +510,19 @@ class _PollingStallError(RuntimeError):
     """
 
 
+class _MessageTextOverride:
+    """Read-only message proxy exposing recovered rich text to routing gates."""
+
+    __slots__ = ("_message", "text")
+
+    def __init__(self, message: Any, text: str) -> None:
+        self._message = message
+        self.text = text
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._message, name)
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -2988,6 +3001,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
+        # Rich-only messages miss PTB's TEXT filter. Separate group preserves all normal lanes.
+        app.add_handler(TypeHandler(Update, self._handle_rich_message_update), group=-100)
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
@@ -6558,28 +6573,105 @@ class TelegramAdapter(BasePlatformAdapter):
             self._observe_unmentioned_group_message(msg, msg_type, update_id=update.update_id)
         return False
 
-    async def _build_triggered_event(self, msg, update, msg_type: MessageType) -> MessageEvent:
+    async def _build_triggered_event(
+        self, msg, update, msg_type: MessageType, *, text_override: Optional[str] = None,
+    ) -> MessageEvent:
         """Event for an addressed text/command: trigger text cleaned (sole addressee only), replied-to
         media cached, attribution applied."""
         from plugins.platforms.telegram.telegram_context import group_trigger_text
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        event.text = group_trigger_text(self, msg, event.text)
+        routing_message = msg if text_override is None else _MessageTextOverride(msg, text_override)
+        text = event.text if text_override is None else text_override
+        event.text = group_trigger_text(self, routing_message, text)
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
-    async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming text; buffers client-split chunks into one MessageEvent."""
+    @classmethod
+    def _extract_inbound_rich_text(cls, message: Any) -> Optional[str]:
+        """Extract plaintext from native or api_kwargs rich-message blocks."""
+        rich_message = getattr(message, "rich_message", None)
+        if rich_message is None:
+            rich_message = cls._rich_node_get(getattr(message, "api_kwargs", None), "rich_message")
+        text = cls._flatten_rich_blocks(cls._rich_node_get(rich_message, "blocks")).strip()
+        return cls._restore_collapsed_numbered_lists(text) if text else None
+
+    @staticmethod
+    def _restore_collapsed_numbered_lists(text: str) -> str:
+        """Restore only structurally credible 1/2/3 runs; leave two-marker prose alone."""
+        marker_pattern = re.compile(r"(?<!\S)([1-9]\d*)\.\s")
+        restored: List[str] = []
+        for line in text.splitlines():
+            matches = list(marker_pattern.finditer(line))
+            if not matches or matches[0].start() != 0 or matches[0].group(1) != "1":
+                restored.append(line)
+                continue
+            boundaries = []
+            expected = 2
+            for match in matches[1:]:
+                if int(match.group(1)) == expected:
+                    boundaries.append(match.start())
+                    expected += 1
+            if expected < 4:
+                restored.append(line)
+                continue
+            start = 0
+            for boundary in boundaries:
+                restored.append(line[start:boundary].rstrip())
+                start = boundary
+            restored.append(line[start:].rstrip())
+        return "\n".join(restored)
+
+    async def _handle_rich_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Raw fallback for rich-only updates missed by PTB filters; never duplicates normal lanes."""
         msg = self._effective_update_message(update)
-        if not msg or not msg.text:
+        if msg is None or getattr(msg, "text", None) or getattr(msg, "caption", None):
+            return
+        media_fields = (
+            "photo", "video", "audio", "voice", "document", "sticker",
+            "animation", "video_note", "location", "venue",
+        )
+        if any(getattr(msg, field, None) for field in media_fields):
+            return
+        text = self._extract_inbound_rich_text(msg)
+        if not text:
+            return
+        logger.info(
+            "[Telegram] Inbound rich fallback update_id=%s message_id=%s chars=%d newlines=%d",
+            getattr(update, "update_id", None), getattr(msg, "message_id", None), len(text), text.count("\n"),
+        )
+        await self._handle_text_message(update, context, text_override=text)
+
+    async def _handle_text_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *, text_override: Optional[str] = None,
+    ) -> None:
+        """Handle incoming text; rich-only updates reuse authorization, routing and batching."""
+        msg = self._effective_update_message(update)
+        text = text_override if text_override is not None else getattr(msg, "text", None)
+        if not msg or not text:
             return
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
             return
-        if not self._gate_or_observe(msg, update, MessageType.TEXT):
-            return
-        await self._ensure_forum_commands(update.message)
-        self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
+        if text_override is None:
+            if not self._gate_or_observe(msg, update, MessageType.TEXT):
+                return
+        else:
+            routing_message = _MessageTextOverride(msg, text)
+            if not self._should_process_message(routing_message):
+                if self._should_observe_unmentioned_group_message(routing_message):
+                    event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+                    event.text = text
+                    self._observe_unmentioned_group_message(
+                        routing_message, MessageType.TEXT, update_id=update.update_id, event=event,
+                    )
+                return
+        await self._ensure_forum_commands(msg)
+        if text_override is None:
+            event = await self._build_triggered_event(msg, update, MessageType.TEXT)
+        else:
+            event = await self._build_triggered_event(msg, update, MessageType.TEXT, text_override=text)
+        self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -7045,6 +7137,18 @@ class TelegramAdapter(BasePlatformAdapter):
             self._dm_topics[cache_key] = int(thread_id)
             logger.info("[%s] Cached DM topic from message: %s -> thread_id=%s", self.name, cache_key, thread_id)
 
+    @staticmethod
+    def _rich_node_get(value: Any, key: str, default: Any = None) -> Any:
+        """Read rich fields from mappings or native PTB model objects."""
+        getter = getattr(value, "get", None)
+        if callable(getter):
+            try:
+                return getter(key, default)
+            except TypeError:
+                result = getter(key)
+                return default if result is None else result
+        return getattr(value, key, default)
+
     @classmethod
     def _flatten_rich_inline_text(cls, value: Any) -> str:
         """Best-effort plaintext flattener for Bot API rich-message inline nodes."""
@@ -7052,35 +7156,31 @@ class TelegramAdapter(BasePlatformAdapter):
             return ""
         if isinstance(value, str):
             return value
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             return "".join(cls._flatten_rich_inline_text(item) for item in value)
-        if isinstance(value, dict):
-            for key in ("text", "children"):
-                if value.get(key) is not None:
-                    return cls._flatten_rich_inline_text(value[key])
+        for key in ("text", "children"):
+            child = cls._rich_node_get(value, key)
+            if child is not None:
+                return cls._flatten_rich_inline_text(child)
         return ""
 
     @classmethod
     def _flatten_rich_blocks(cls, blocks: Any) -> str:
         """Best-effort plaintext flattener for Bot API rich-message blocks."""
-        if not isinstance(blocks, list):
+        if not isinstance(blocks, (list, tuple)):
             return ""
         lines: List[str] = []
         for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "list":
-                for item in block.get("items", []):
-                    if not isinstance(item, dict):
-                        continue
-                    item_lines = cls._flatten_rich_blocks(item.get("blocks")).splitlines()
+            if cls._rich_node_get(block, "type") == "list":
+                for item in cls._rich_node_get(block, "items", []) or []:
+                    item_lines = cls._flatten_rich_blocks(cls._rich_node_get(item, "blocks")).splitlines()
                     if not item_lines:
                         continue
-                    label = item.get("label")
+                    label = cls._rich_node_get(item, "label")
                     lines.append(f"{label} {item_lines[0]}".strip() if label else item_lines[0])
                     lines.extend(item_lines[1:])
                 continue
-            text = cls._flatten_rich_inline_text(block.get("text"))
+            text = cls._flatten_rich_inline_text(cls._rich_node_get(block, "text"))
             if text:
                 lines.extend(text.splitlines())
         return "\n".join(line.rstrip() for line in lines if line)
