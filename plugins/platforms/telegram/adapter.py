@@ -6264,6 +6264,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
+        from plugins.platforms.telegram.telegram_context import mentions_only_peer_suppressed
+        if mentions_only_peer_suppressed(self, message):
+            return False
         if self._is_own_message(message) or not self._telegram_observe_unmentioned_group_messages() or not self._is_group_chat(message):
             return False
         if self._topic_gates_pass(getattr(message, "message_thread_id", None), warn_non_numeric=False) is False:
@@ -6507,6 +6510,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # addressed to some other bot.
         self._observe_bot_identity_from_message(message)
         if self._is_own_message(message):
+            return False
+        from plugins.platforms.telegram.telegram_context import mentions_only_peer_suppressed
+        if mentions_only_peer_suppressed(self, message):
             return False
         if not self._is_group_chat(message):
             return True
@@ -7298,7 +7304,7 @@ class TelegramAdapter(BasePlatformAdapter):
             is_bot=bool(getattr(user, "is_bot", False)) if user else False)
         reply_to_id, reply_to_text = self._reply_context(message)
         from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
-        from plugins.platforms.telegram.telegram_context import group_identity_prompt
+        from plugins.platforms.telegram.telegram_context import group_identity_prompt, reply_expected
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
         return MessageEvent(
@@ -7306,6 +7312,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
+            reply_expected=reply_expected(self, message),
             timestamp=message.date)
 
     # -- Message reactions (processing lifecycle) --
