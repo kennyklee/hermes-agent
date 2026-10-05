@@ -50,10 +50,12 @@ def reply_expected(adapter: "TelegramAdapter", message: "Message") -> Optional[b
         return True
     if not getattr(adapter, "_bot", None):
         return None  # No identity: retain the gateway's unknown-address fallback.
-    if adapter._message_mentions_bot(message):
-        return True
+    # A peer's explicit mention permits dispatch, not a mandatory answer.
+    # Preserve intentional silence instead of creating another bot warning.
     if adapter._sender_is_other_bot(message):
         return False
+    if adapter._message_mentions_bot(message):
+        return True
     return adapter._is_reply_to_bot(message) or adapter._message_matches_mention_patterns(message)
 
 
