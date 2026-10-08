@@ -446,6 +446,16 @@ _UPDATER_START_TIMEOUT = 30.0  # start_polling() can hang on a degraded pool aft
 # unreachable. Bounding start_polling() prevents the reconnect ladder from stalling indefinitely and allows
 # the heartbeat loop to trigger its own recovery path. Refs: NousResearch/hermes-agent#59614
 _INITIAL_POLLING_PROGRESS_TIMEOUT = 60.0
+# Cold-start fast-connect probe: the first getUpdates long-poll only returns once it has updates or the
+# server-side long-poll window elapses (~10s with an empty queue), so gating the connect banner on the
+# getUpdates progress event made every idle cold boot appear to hang for that whole window (~10.4s observed
+# on a production restart). A getMe() round-trip proves the token + transport are live within a fraction of
+# a second WITHOUT touching the getUpdates offset (general request pool only), so update delivery is
+# byte-for-byte unchanged. Bound it modestly so a wedged general pool can't pin the gate; on a network
+# failure the probe does not resolve and the gate falls back to the getUpdates progress event / strict
+# polling error / overall deadline. Wedge detection is unweakened: the background progress verifier
+# (now scheduled on cold start too) still demands a real getUpdates round-trip within _POLLING_PROGRESS_TIMEOUT.
+_INITIAL_CONNECT_PROBE_TIMEOUT = 10.0
 # Bounded drain (shutdown()/initialize() of the getUpdates request) so a wedged socket can't freeze
 # _polling_error_task and gate every escalation path behind its in-flight guard.
 # shutdown()/initialize() on the getUpdates httpx request close and rebuild the connection pool. When a
@@ -2007,15 +2017,41 @@ class TelegramAdapter(BasePlatformAdapter):
             self._send_path_degraded = True
             return False
 
+    async def _probe_initial_transport(self) -> None:
+        """Resolve as soon as a getMe() round-trip proves token + transport are live — the fast cold-start
+        proof. getMe() rides the general request pool and never touches the getUpdates offset, so update
+        delivery is byte-for-byte unchanged. A network failure does NOT resolve (the caller falls back to
+        the getUpdates progress event / strict polling error / overall deadline); a non-network error
+        (e.g. an invalid token) propagates so startup fails loudly."""
+        bot = getattr(self._app, "bot", None) or self._bot
+        if bot is not None:
+            try:
+                await _await_with_thread_deadline(bot.get_me(), timeout=_INITIAL_CONNECT_PROBE_TIMEOUT)
+                return
+            except Exception as err:
+                if not self._looks_like_network_error(err):
+                    raise
+        # No bot, or the probe hit a network error: leave readiness to getUpdates progress / strict error /
+        # the overall deadline. Never resolving means a transient getMe() failure can't fail connect closed.
+        await asyncio.Event().wait()
+
     async def _await_cold_start_readiness(self, progress: asyncio.Event, strict_error_event: asyncio.Event, strict_error: list) -> None:
-        """Cold start: wait for THIS generation's first getUpdates success or the first polling error;
-        raises OSError so GatewayRunner disposes the partial adapter and retries fresh."""
+        """Cold start: confirm the transport is live FAST, then let the background verifier own getUpdates
+        progress. Readiness is satisfied by EITHER this generation's first getUpdates round-trip (strongest
+        proof, wins when updates are queued) OR a getMe() bootstrap probe (wins on an idle cold boot, where
+        the first long-poll would otherwise block for ~10s). A real polling error still fails closed, and so
+        does an unconfirmable transport — raising OSError so GatewayRunner disposes the partial adapter and
+        retries fresh. The scheduled progress verifier keeps wedge detection intact (#67498)."""
+        if progress.is_set():
+            return
         progress_wait = asyncio.ensure_future(progress.wait())
         error_wait = asyncio.ensure_future(strict_error_event.wait())
+        probe_wait = asyncio.ensure_future(self._probe_initial_transport())
         try:
             # Losers are NOT cancelled here; the finally below does it.
             await _await_with_thread_deadline(
-                asyncio.wait({progress_wait, error_wait}, return_when=asyncio.FIRST_COMPLETED), timeout=_INITIAL_POLLING_PROGRESS_TIMEOUT)
+                asyncio.wait({progress_wait, error_wait, probe_wait}, return_when=asyncio.FIRST_COMPLETED),
+                timeout=_INITIAL_POLLING_PROGRESS_TIMEOUT)
         except asyncio.TimeoutError as exc:
             raise OSError(
                 "Telegram getUpdates made no progress within "
@@ -2023,17 +2059,32 @@ class TelegramAdapter(BasePlatformAdapter):
                 "connect — failing startup so the gateway retries with a fresh adapter (#67498)"
            ) from exc
         finally:
-            for fut in (progress_wait, error_wait):
+            for fut in (progress_wait, error_wait, probe_wait):
                 if not fut.done():
                     fut.cancel()
-            await asyncio.gather(progress_wait, error_wait, return_exceptions=True)
+            await asyncio.gather(progress_wait, error_wait, probe_wait, return_exceptions=True)
+        # Precedence: a real polling error means polling itself is broken — fail closed even if getMe passed.
         if strict_error and not progress.is_set():
             raise OSError(
                 "Telegram polling errored before first getUpdates success during initial connect: "
                 f"{_redact_telegram_error_text(strict_error[0])}"
            ) from strict_error[0]
-        if not progress.is_set():
-            raise OSError("Telegram getUpdates did not become ready during initial connect")
+        if progress.is_set():
+            return
+        if probe_wait.done() and not probe_wait.cancelled():
+            probe_exc = probe_wait.exception()
+            if probe_exc is None:
+                # getMe confirmed the transport; the background progress verifier now owns getUpdates health.
+                logger.info(
+                    "[%s] Telegram connect confirmed via getMe bootstrap probe; getUpdates progress "
+                    "verified in the background (generation %d)", self.name, getattr(self, "_polling_generation", 0))
+                return
+            # A non-network probe error (e.g. invalid token): surface it so startup fails loudly.
+            raise OSError(
+                "Telegram getMe probe failed during initial connect: "
+                f"{_redact_telegram_error_text(probe_exc)}"
+           ) from probe_exc
+        raise OSError("Telegram getUpdates did not become ready during initial connect")
 
     async def _start_polling_resilient(self, *, drop_pending_updates: bool, error_callback, require_progress: bool = False) -> bool:
         """Start PTB polling; ``require_progress`` (initial connect) demands real readiness. Reconnects
@@ -2071,8 +2122,10 @@ class TelegramAdapter(BasePlatformAdapter):
             generation, progress = await self._start_polling_once(
                 self._app, drop_pending_updates=drop_pending_updates, error_callback=effective_callback,
                 abandon_app_on_timeout=require_progress,
-                # The strict gate IS the cold-start verifier; a background one would race it.
-                schedule_verifier=not require_progress)
+                # Always schedule the background verifier: on cold start the gate may now open via the getMe
+                # bootstrap probe before getUpdates has round-tripped, so the verifier (not the strict gate)
+                # is what still demands real getUpdates progress within _POLLING_PROGRESS_TIMEOUT.
+                schedule_verifier=True)
             if require_progress:
                 await self._await_cold_start_readiness(progress, strict_error_event, strict_error)
                 # Readiness proven — close the gate so later errors reach background recovery.
