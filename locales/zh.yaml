@@ -305,6 +305,15 @@ gateway:
     none_connected: "没有连接的 MCP 服务器。"
     tools_available: "\n🔧 来自 {servers} 个服务器的 {tools} 个工具可用"
     failed: "❌ MCP 重新加载失败：{error}"
+  reload_platform:
+    usage: "用法：/reload-platform <name> — 使用全新配置重新连接单个平台适配器（无需重启网关）。"
+    not_connected: "{name} 没有可重新加载的活动适配器（未启用，或由次要配置文件拥有）。使用 `/platform list` 查看平台状态。"
+    queued: "{name} 已在重新连接队列中 — 监视器正在重试。请使用 `/platform resume {name}` 或 `hermes gateway restart`。"
+    disabled: "{name} 已在 config.yaml 中禁用 — 没有可重新加载的内容。请先启用，然后执行 `hermes gateway restart`。"
+    config_error: "❌ 无法重新加载 {name} 的配置：{error}"
+    reloaded: "✓ {name} 已使用全新配置重新加载并重新连接。"
+    retrying: "⚠️ {name} 已重新加载，但未立即重新连接 — 正在后台重试。请查看 `/platform list`。"
+    failed: "❌ /reload-platform {name} 失败：{error}"
   reload_skills:
     header: "🔄 **技能已重新加载**\n"
     no_new: "未检测到新技能。"

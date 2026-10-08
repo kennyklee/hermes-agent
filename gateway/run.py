@@ -5297,6 +5297,19 @@ def _start_gateway_make_restart_signal_handler(runner):
     return restart_signal_handler
 
 
+def _start_gateway_make_reload_platforms_signal_handler(runner):
+    """Build the SIGHUP handler: hot-reload config.yaml and reconnect ONLY the connected platforms
+    whose ``platforms.<name>`` section changed since boot — no drain, no relaunch, other platforms
+    and in-flight turns untouched. (SIGUSR1 stays the drain-and-relaunch service restart.)"""
+    def reload_platforms_signal_handler():
+        logger.info("SIGHUP received — hot-reloading platforms whose config changed on disk")
+        task = asyncio.create_task(runner._reload_changed_platforms_from_disk())
+        retain = getattr(runner, "_retain_background_task", None)
+        if callable(retain):
+            retain(task)
+    return reload_platforms_signal_handler
+
+
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
     planned_stop_seen = [False]
@@ -5892,6 +5905,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         runner, _signal_initiated_shutdown)
 
     restart_signal_handler = _start_gateway_make_restart_signal_handler(runner)
+    reload_platforms_signal_handler = _start_gateway_make_reload_platforms_signal_handler(runner)
 
     loop = asyncio.get_running_loop()
 
@@ -5909,6 +5923,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         handlers = [(sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
         if hasattr(signal, "SIGUSR1"):
             handlers.append((signal.SIGUSR1, restart_signal_handler, ()))  # windows-footgun: ok — hasattr-guarded
+        if hasattr(signal, "SIGHUP"):
+            handlers.append((signal.SIGHUP, reload_platforms_signal_handler, ()))  # windows-footgun: ok — hasattr-guarded
         for sig, handler, args in handlers:
             with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, handler, *args)  # windows-footgun: ok — suppress(NotImplementedError)

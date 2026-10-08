@@ -305,6 +305,15 @@ gateway:
     none_connected: "接続中の MCP サーバーはありません。"
     tools_available: "\n🔧 {servers} 台のサーバーから {tools} 個のツールが利用可能"
     failed: "❌ MCP の再読み込みに失敗しました: {error}"
+  reload_platform:
+    usage: "使い方: /reload-platform <name> — 1 つのプラットフォームアダプターを新しい設定で再接続します（ゲートウェイの再起動なし）。"
+    not_connected: "{name} には再読み込みできる稼働中のアダプターがありません（無効、またはセカンダリプロファイルが所有）。`/platform list` でプラットフォームの状態を確認してください。"
+    queued: "{name} はすでに再接続キューにあります — ウォッチャーが再試行中です。`/platform resume {name}` または `hermes gateway restart` を使用してください。"
+    disabled: "{name} は config.yaml で無効になっています — 再読み込みするものはありません。有効化してから `hermes gateway restart` を実行してください。"
+    config_error: "❌ {name} の設定を再読み込みできませんでした: {error}"
+    reloaded: "✓ {name} を新しい設定で再読み込みし、再接続しました。"
+    retrying: "⚠️ {name} を再読み込みしましたが、すぐには再接続しませんでした — バックグラウンドで再試行中です。`/platform list` を確認してください。"
+    failed: "❌ /reload-platform {name} が失敗しました: {error}"
   reload_skills:
     header: "🔄 **スキルを再読み込みしました**\n"
     no_new: "新しいスキルは検出されませんでした。"

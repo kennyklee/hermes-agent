@@ -305,6 +305,15 @@ gateway:
     none_connected: "Нет подключённых MCP-серверов."
     tools_available: "\n🔧 {tools} инструмент(ов) доступно с {servers} сервер(ов)"
     failed: "❌ Ошибка перезагрузки MCP: {error}"
+  reload_platform:
+    usage: "Использование: /reload-platform <name> — переподключить один адаптер платформы со свежей конфигурацией (без перезапуска шлюза)."
+    not_connected: "У {name} нет активного адаптера для перезагрузки (не включён или принадлежит вторичному профилю). Используйте `/platform list`, чтобы увидеть статус платформ."
+    queued: "{name} уже в очереди переподключения — наблюдатель повторяет попытки. Используйте `/platform resume {name}` или `hermes gateway restart`."
+    disabled: "{name} отключён в config.yaml — нечего перезагружать. Включите его, затем `hermes gateway restart`."
+    config_error: "❌ Не удалось перезагрузить конфигурацию для {name}: {error}"
+    reloaded: "✓ {name} перезагружен со свежей конфигурацией и переподключён."
+    retrying: "⚠️ {name} перезагружен, но не переподключился сразу — повтор попытки в фоне. Проверьте `/platform list`."
+    failed: "❌ /reload-platform {name} завершился ошибкой: {error}"
   reload_skills:
     header: "🔄 **Навыки перезагружены**\n"
     no_new: "Новых навыков не обнаружено."

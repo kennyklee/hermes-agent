@@ -305,6 +305,15 @@ gateway:
     none_connected: "لا توجد خوادم MCP متصلة."
     tools_available: "\n🔧 {tools} أداة متاحة من {servers} خادم"
     failed: "❌ فشلت إعادة تحميل MCP: {error}"
+  reload_platform:
+    usage: "الاستخدام: /reload-platform <name> — أعِد الاتصال بمحوّل منصّة واحد بإعدادات جديدة (دون إعادة تشغيل البوابة)."
+    not_connected: "لا يوجد محوّل نشط لـ {name} لإعادة تحميله (غير مُفعّل، أو مملوك لملف تعريف ثانوي). استخدم `/platform list` لعرض حالة المنصّات."
+    queued: "{name} موجود بالفعل في قائمة إعادة الاتصال — المراقِب يعيد المحاولة. استخدم `/platform resume {name}` أو `hermes gateway restart`."
+    disabled: "{name} مُعطّل في config.yaml — لا شيء لإعادة تحميله. فعّله، ثم `hermes gateway restart`."
+    config_error: "❌ تعذّر إعادة تحميل الإعدادات لـ {name}: {error}"
+    reloaded: "✓ تمت إعادة تحميل {name} بإعدادات جديدة وإعادة الاتصال."
+    retrying: "⚠️ تمت إعادة تحميل {name} لكنه لم يُعِد الاتصال فورًا — جارٍ إعادة المحاولة في الخلفية. تحقّق من `/platform list`."
+    failed: "❌ فشل /reload-platform {name}: {error}"
   reload_skills:
     header: "🔄 **أُعيد تحميل المهارات**\n"
     no_new: "لم تُكتشف مهارات جديدة."

@@ -341,6 +341,15 @@ gateway:
     none_connected: "Aucun serveur MCP connecté."
     tools_available: "\n🔧 {tools} outil(s) disponible(s) sur {servers} serveur(s)"
     failed: "❌ Échec du rechargement MCP : {error}"
+  reload_platform:
+    usage: "Utilisation : /reload-platform <name> — reconnecte un adaptateur de plateforme avec une configuration fraîche (sans redémarrer le gateway)."
+    not_connected: "{name} n'a aucun adaptateur actif à recharger (non activé, ou détenu par un profil secondaire). Utilisez `/platform list` pour voir l'état des plateformes."
+    queued: "{name} est déjà dans la file de reconnexion — le watcher réessaie. Utilisez `/platform resume {name}` ou `hermes gateway restart`."
+    disabled: "{name} est désactivé dans config.yaml — rien à recharger. Activez-le, puis `hermes gateway restart`."
+    config_error: "❌ Impossible de recharger la configuration de {name} : {error}"
+    reloaded: "✓ {name} rechargé avec une configuration fraîche et reconnecté."
+    retrying: "⚠️ {name} rechargé mais non reconnecté immédiatement — nouvelle tentative en arrière-plan. Consultez `/platform list`."
+    failed: "❌ /reload-platform {name} a échoué : {error}"
   reload_skills:
     header: "🔄 **Skills rechargées**\n"
     no_new: "Aucune nouvelle skill détectée."

@@ -305,6 +305,15 @@ gateway:
     none_connected: "연결된 MCP 서버가 없습니다."
     tools_available: "\n🔧 {servers}개 서버에서 {tools}개 도구 사용 가능"
     failed: "❌ MCP 재로드 실패: {error}"
+  reload_platform:
+    usage: "사용법: /reload-platform <name> — 플랫폼 어댑터 하나를 새 구성으로 재연결합니다(게이트웨이 재시작 없음)."
+    not_connected: "{name}에 재로드할 활성 어댑터가 없습니다(활성화되지 않았거나 보조 프로필이 소유). `/platform list`로 플랫폼 상태를 확인하세요."
+    queued: "{name}은(는) 이미 재연결 큐에 있습니다 — 워처가 재시도 중입니다. `/platform resume {name}` 또는 `hermes gateway restart`를 사용하세요."
+    disabled: "{name}은(는) config.yaml에서 비활성화되어 있습니다 — 재로드할 것이 없습니다. 활성화한 다음 `hermes gateway restart`를 실행하세요."
+    config_error: "❌ {name}의 구성을 재로드할 수 없습니다: {error}"
+    reloaded: "✓ {name}을(를) 새 구성으로 재로드하고 재연결했습니다."
+    retrying: "⚠️ {name}을(를) 재로드했지만 즉시 재연결되지 않았습니다 — 백그라운드에서 재시도 중입니다. `/platform list`를 확인하세요."
+    failed: "❌ /reload-platform {name} 실패: {error}"
   reload_skills:
     header: "🔄 **스킬이 재로드되었습니다**\n"
     no_new: "새로운 스킬이 감지되지 않았습니다."

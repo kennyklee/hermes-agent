@@ -305,6 +305,15 @@ gateway:
     none_connected: "Bağlı MCP sunucusu yok."
     tools_available: "\n🔧 {servers} sunucudan {tools} araç kullanılabilir"
     failed: "❌ MCP yeniden yükleme başarısız: {error}"
+  reload_platform:
+    usage: "Kullanım: /reload-platform <name> — bir platform adaptörünü yeni yapılandırmayla yeniden bağlar (gateway yeniden başlatmadan)."
+    not_connected: "{name} için yeniden yüklenecek etkin bir adaptör yok (etkin değil veya ikincil bir profile ait). Platform durumunu görmek için `/platform list` kullanın."
+    queued: "{name} zaten yeniden bağlanma kuyruğunda — izleyici yeniden deniyor. `/platform resume {name}` veya `hermes gateway restart` kullanın."
+    disabled: "{name}, config.yaml içinde devre dışı — yeniden yüklenecek bir şey yok. Etkinleştirin, ardından `hermes gateway restart`."
+    config_error: "❌ {name} için yapılandırma yeniden yüklenemedi: {error}"
+    reloaded: "✓ {name} yeni yapılandırmayla yeniden yüklendi ve yeniden bağlandı."
+    retrying: "⚠️ {name} yeniden yüklendi ancak hemen yeniden bağlanmadı — arka planda yeniden deneniyor. `/platform list` kontrol edin."
+    failed: "❌ /reload-platform {name} başarısız: {error}"
   reload_skills:
     header: "🔄 **Beceriler Yeniden Yüklendi**\n"
     no_new: "Yeni beceri tespit edilmedi."

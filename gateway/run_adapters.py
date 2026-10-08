@@ -867,6 +867,70 @@ class GatewayAdapterLifecycleMixin:
             backoff = self._bump_reconnect_backoff(platform, info, attempt, None, str(e))
             logger.warning("Reconnect %s error: %s, next retry in %ds", platform.value, e, backoff)
 
+    async def _reload_platform_adapter(self, platform, platform_config) -> bool:
+        """Reconnect one live primary adapter with fresh config, reusing the failure→reconnect path.
+
+        Points the running config at the fresh ``platforms.<name>`` section, disconnects the live
+        adapter, then hands the platform to the same queue→reconnect→install machinery the watcher
+        uses after an outage. The new adapter connects with ``is_reconnect=True`` so the server-side
+        update queue is preserved and messages sent during the brief swap are redelivered, not
+        dropped (#46621). Returns True once reconnected; on failure the platform stays queued and the
+        watcher keeps retrying in the background with the fresh config.
+        """
+        old = self.adapters.get(platform)
+        # Build the queue entry (carries inbound dedup + exclusive claims off the live adapter) BEFORE
+        # teardown, while those attributes are still readable.
+        entry = self._reconnect_queue_entry(platform, old, platform_config, attempts=0, delay=0.0)
+        # Point the running config at the fresh section so every downstream path (the reconnect
+        # watcher, status reads, a later reload) sees the new settings.
+        self.config.platforms[platform] = platform_config
+        if old is not None:
+            self.adapters.pop(platform, None)
+            self.delivery_router.adapters = self.adapters
+            # A second poller on the same bot token/listener would conflict (e.g. Telegram 409), so the
+            # live adapter is torn down before the replacement connects.
+            await self._bounded_adapter_teardown(old, platform)
+        self._failed_platforms[platform] = entry
+        self._ensure_reconnect_watcher_running()
+        # Drive one attempt inline so the command can report connected-vs-retrying-in-background.
+        await self._reconnect_failed_platform(platform, time.monotonic())
+        return platform in self.adapters
+
+    def _changed_connected_platforms(self, fresh_config) -> list:
+        """Connected primary platforms whose ``platforms.<name>`` section differs from the running
+        config (``PlatformConfig`` is a dataclass, so ``!=`` is a structural compare). Used by the
+        SIGHUP hot-reload to touch only the platforms that actually changed on disk."""
+        changed = []
+        for platform in list(self.adapters.keys()):
+            new_config = fresh_config.platforms.get(platform)
+            if new_config is None or not getattr(new_config, "enabled", True):
+                continue  # disabled/removed platforms are left to a full restart, never half-reloaded
+            if self.config.platforms.get(platform) != new_config:
+                changed.append(platform)
+        return changed
+
+    async def _reload_changed_platforms_from_disk(self) -> list:
+        """SIGHUP entrypoint: reload config.yaml and reconnect only the connected platforms whose
+        ``platforms.<name>`` section changed since boot. Returns the list of reloaded platforms."""
+        from gateway.config import load_gateway_config
+        try:
+            fresh = load_gateway_config()
+        except Exception:
+            logger.warning("SIGHUP config reload failed — leaving platforms unchanged", exc_info=True)
+            return []
+        changed = self._changed_connected_platforms(fresh)
+        if not changed:
+            logger.info("SIGHUP: no connected platform's config changed — nothing to reload")
+            return []
+        logger.info(
+            "SIGHUP: reloading %d platform(s) with changed config: %s",
+            len(changed), ", ".join(p.value for p in changed),
+        )
+        for platform in changed:
+            with _log_suppressed(logging.WARNING, "SIGHUP reload of %s failed", platform.value):
+                await self._reload_platform_adapter(platform, fresh.platforms[platform])
+        return changed
+
     def _drop_from_reconnect_queue(self, platform, reason: str) -> None:
         logger.warning("Reconnect %s: %s, removing from retry queue", platform.value, reason)
         del self._failed_platforms[platform]

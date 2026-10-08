@@ -526,6 +526,47 @@ class GatewaySlashCommandsMixin(
         self._resume_paused_platform(platform)
         return t("gateway.platform.resumed", name=name)
 
+    async def _handle_reload_platform_command(self, event: MessageEvent) -> str:
+        """Handle ``/reload-platform <name>`` — reconnect ONE platform adapter with fresh config from
+        disk, without restarting the gateway or touching other platforms. Reloads the primary adapter
+        for ``<name>``; config changes elsewhere are untouched."""
+        # Prefer ``text`` (the real MessageEvent field); fall back to ``content`` for callers that set it.
+        raw = (getattr(event, "content", None) or getattr(event, "text", "") or "")
+        parts = raw.strip().split(maxsplit=2)
+        if parts and parts[0].lower().lstrip("/").startswith("reload"):
+            parts = parts[1:]
+        target = parts[0].lower() if parts else ""
+        if not target:
+            return t("gateway.reload_platform.usage")
+        platform = next((p for p in Platform.__members__.values() if p.value.lower() == target), None)
+        if platform is None:
+            return t("gateway.platform.unknown", name=target)
+        name = platform.value
+        # Only a currently-connected primary adapter can be hot-reloaded. A platform that is queued
+        # (failed/paused) is already owned by the reconnect watcher; a disabled or secondary-owned one
+        # has no live primary adapter to swap — refuse rather than half-reload.
+        if platform not in self.adapters:
+            if platform in (getattr(self, "_failed_platforms", {}) or {}):
+                return t("gateway.reload_platform.queued", name=name)
+            return t("gateway.reload_platform.not_connected", name=name)
+        # Reload the platform's section fresh from disk (config.yaml), honoring env overrides/validation.
+        from gateway.config import load_gateway_config
+        try:
+            fresh = load_gateway_config()
+        except Exception as e:
+            return t("gateway.reload_platform.config_error", name=name, error=e)
+        new_config = fresh.platforms.get(platform)
+        if new_config is None or not getattr(new_config, "enabled", True):
+            return t("gateway.reload_platform.disabled", name=name)
+        try:
+            connected = await self._reload_platform_adapter(platform, new_config)
+        except Exception as e:
+            logger.warning("/reload-platform %s failed", name, exc_info=True)
+            return t("gateway.reload_platform.failed", name=name, error=e)
+        if connected:
+            return t("gateway.reload_platform.reloaded", name=name)
+        return t("gateway.reload_platform.retrying", name=name)
+
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
         from gateway.run import _hermes_home
