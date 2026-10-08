@@ -101,6 +101,12 @@ def _calver_release_version(repo_dir: Path) -> tuple[str, int] | None:
     ``requires_hermes``.
     """
     described = _run_git(repo_dir, "describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*", "HEAD")
+    return _calver_from_describe(repo_dir, described)
+
+
+def _calver_from_describe(repo_dir: Path, described: str | None) -> tuple[str, int] | None:
+    """The CalVer resolution from an already-run ``git describe`` output (so the describe can be
+    issued concurrently with the other boot-path git queries). ``show`` still depends on the tag."""
     if not described:
         return None
     tag, count, _ = described.rsplit("-", 2)
@@ -204,34 +210,59 @@ def _stamp_version_info() -> VersionInfo | None:
 # --- Git provenance (source/dev installs) -----------------------------------
 
 
+def _git_is_dirty(repo_dir: Path, include_untracked: bool = False) -> bool:
+    # -uno: skip the untracked-file scan. This runs on the startup-banner path, and a full
+    # working-tree walk costs real time on large or cold checkouts. Same semantics as
+    # write_install_stamp.py.
+    status_command = ["git", "status", "--porcelain"]
+    if not include_untracked:
+        status_command.append("-uno")
+    try:
+        result = subprocess.run(
+            status_command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=3, cwd=str(repo_dir),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
 def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> VersionInfo:
-    commit = _run_git(repo_dir, "rev-parse", "HEAD")
-    # A detached HEAD has no branch. Leave the field None: every formatter
-    # already prints the commit separately and handles a missing branch.
-    branch = _run_git(repo_dir, "branch", "--show-current")
-    commit_date_raw = _run_git(repo_dir, "log", "-1", "--format=%ct", "HEAD")
+    # These independent, read-only git queries dominate startup on a git/dev install (~1.3s of
+    # sequential subprocess spawns, on the pre-"Starting Hermes Gateway" boot path). They touch
+    # nothing and don't depend on each other, so gather them concurrently — each keeps its own 3s
+    # timeout. The base_version-dependent rev-list and the CalVer fallback stay sequential after.
+    # Output is identical to the former sequential form.
+    from concurrent.futures import ThreadPoolExecutor
+    _leaf_jobs = {
+        "commit": ("rev-parse", "HEAD"),
+        # A detached HEAD has no branch. Leave the field None: every formatter already prints the
+        # commit separately and handles a missing branch.
+        "branch": ("branch", "--show-current"),
+        "commit_date": ("log", "-1", "--format=%ct", "HEAD"),
+        "tags": ("tag", "--merged", "HEAD", "--list", "v[0-9]*"),
+        "short_commit": ("rev-parse", "--short=7", "HEAD"),
+        # Speculative: the CalVer fallback's `describe` is the second-slowest query and is needed
+        # whenever no stable semver tag is merged into HEAD — the common case on CalVer/canary
+        # checkouts. Issuing it here overlaps it with the equally-slow `tag --merged` instead of
+        # serializing the two; it is simply ignored when a stable release tag IS found.
+        "described": ("describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*", "HEAD"),
+    }
+    with ThreadPoolExecutor(max_workers=len(_leaf_jobs) + 1) as _pool:
+        _futs = {name: _pool.submit(_run_git, repo_dir, *args) for name, args in _leaf_jobs.items()}
+        _dirty_fut = _pool.submit(_git_is_dirty, repo_dir, include_untracked)
+        _leaves = {name: fut.result() for name, fut in _futs.items()}
+        dirty = _dirty_fut.result()
+
+    commit = _leaves["commit"]
+    branch = _leaves["branch"]
+    commit_date_raw = _leaves["commit_date"]
     commit_date: int | None = None
     if commit_date_raw and commit_date_raw.isdigit():
         commit_date = int(commit_date_raw)
-    try:
-        # -uno: skip the untracked-file scan. This runs on the startup-banner
-        # path, and a full working-tree walk costs real time on large or cold
-        # checkouts. Same semantics as write_install_stamp.py.
-        status_command = ["git", "status", "--porcelain"]
-        if not include_untracked:
-            status_command.append("-uno")
-        dirty_result = subprocess.run(
-            status_command,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=3,
-            cwd=str(repo_dir),
-        )
-        dirty = dirty_result.returncode == 0 and bool((dirty_result.stdout or "").strip())
-    except (OSError, subprocess.SubprocessError):
-        dirty = False
+    short_commit = _leaves["short_commit"]
 
-    tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
+    tags = _leaves["tags"]
     releases = [
         tag[1:]
         for tag in (tags or "").splitlines()
@@ -245,8 +276,7 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
         _run_git(repo_dir, "rev-list", "--count", f"v{base_version}..HEAD")
     ) if releases else None
     if not releases:
-        base_version, distance = _calver_release_version(repo_dir) or ("unknown", None)
-    short_commit = _run_git(repo_dir, "rev-parse", "--short=7", "HEAD")
+        base_version, distance = _calver_from_describe(repo_dir, _leaves["described"]) or ("unknown", None)
     if base_version == "unknown" and short_commit:
         display_version = f"git.{short_commit}{'.dirty' if dirty else ''}"
     else:

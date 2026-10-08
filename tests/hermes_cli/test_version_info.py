@@ -2,9 +2,12 @@ import json
 from pathlib import Path
 import subprocess
 
+import hermes_cli.version_info as version_info
 from hermes_cli.version_info import (
     VersionInfo,
+    _calver_from_describe,
     _derived_version,
+    _git_version_info,
     _reset_version_info_cache,
     _resolve_stamp_file,
     _stamp_version_info,
@@ -241,6 +244,73 @@ def test_resolve_stamp_file_falls_back_to_code_root_when_env_unset(tmp_path, mon
     monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path)
 
     assert _resolve_stamp_file() == tmp_path / "install-stamp.json"
+
+
+def test_calver_from_describe_parses_an_already_run_describe(monkeypatch):
+    """The CalVer resolver works from a pre-fetched `git describe` output (so the describe can be
+    issued concurrently with the other boot-path git queries)."""
+    monkeypatch.setattr(version_info, "_run_git",
+                        lambda repo, *a: '[project]\nversion = "0.21.4"\n' if a[0] == "show" else None)
+    assert _calver_from_describe(Path("/x"), "v2026.9.21-1-gabc1234") == ("0.21.4", 1)
+    # No describe output / malformed → None, never a crash.
+    assert _calver_from_describe(Path("/x"), None) is None
+    assert _calver_from_describe(Path("/x"), "") is None
+
+
+def _recording_git(mapping, calls):
+    def _run(repo, *args):
+        calls.append(args)
+        return mapping.get(args)
+    return _run
+
+
+def test_git_version_info_issues_describe_speculatively_on_the_semver_path(monkeypatch):
+    """A stable semver tag wins, but `describe` is still issued (concurrently) — its result is just
+    ignored. Proves the speculative overlap does not change the resolved identity."""
+    calls = []
+    mapping = {
+        ("rev-parse", "HEAD"): "a" * 40,
+        ("branch", "--show-current"): "main",
+        ("log", "-1", "--format=%ct", "HEAD"): "1700000000",
+        ("tag", "--merged", "HEAD", "--list", "v[0-9]*"): "v1.2.3",
+        ("rev-parse", "--short=7", "HEAD"): "abc1234",
+        ("describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*", "HEAD"): "v2026.1.1-9-gdead",
+        ("rev-list", "--count", "v1.2.3..HEAD"): "5",
+    }
+    monkeypatch.setattr(version_info, "_run_git", _recording_git(mapping, calls))
+    monkeypatch.setattr(version_info, "_git_is_dirty", lambda repo, include_untracked=False: False)
+
+    info = _git_version_info(Path("/x"))
+
+    assert info.base_version == "1.2.3"
+    assert info.distance == 5
+    assert info.derived_version == "1.2.3+5.gabc1234"
+    assert info.commit_date == 1700000000
+    # describe was issued even though the semver tag won (speculative overlap), and the CalVer value
+    # it would have produced did NOT leak into the result.
+    assert ("describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*", "HEAD") in calls
+
+
+def test_git_version_info_uses_the_speculative_describe_on_the_calver_path(monkeypatch):
+    """No stable semver tag → the already-issued describe drives CalVer resolution."""
+    calls = []
+    mapping = {
+        ("rev-parse", "HEAD"): "b" * 40,
+        ("branch", "--show-current"): "main",
+        ("log", "-1", "--format=%ct", "HEAD"): "1700000000",
+        ("tag", "--merged", "HEAD", "--list", "v[0-9]*"): "",  # no stable release merged
+        ("rev-parse", "--short=7", "HEAD"): "beef123",
+        ("describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*", "HEAD"): "v2026.9.21-7040-gbeef123",
+        ("show", "v2026.9.21:pyproject.toml"): '[project]\nversion = "0.21.5"\n',
+    }
+    monkeypatch.setattr(version_info, "_run_git", _recording_git(mapping, calls))
+    monkeypatch.setattr(version_info, "_git_is_dirty", lambda repo, include_untracked=False: False)
+
+    info = _git_version_info(Path("/x"))
+
+    assert info.base_version == "0.21.5"
+    assert info.distance == 7040
+    assert info.derived_version == "0.21.5+7040.gbeef123"
 
 
 def test_old_updater_version_stub_reads_the_same_stamp_as_version_info(tmp_path):
