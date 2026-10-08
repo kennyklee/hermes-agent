@@ -128,6 +128,9 @@ async def test_cold_connect_confirms_via_getme_without_awaiting_first_long_poll(
         # The getMe bootstrap probe confirmed health — not a getUpdates round-trip.
         get_me.assert_awaited()
         assert not adapter._polling_progress_event.is_set()
+        # getMe proved the send path: outbound sends (restart notice, replies) must not be refused as
+        # send_path_degraded while the first idle long poll is still pending.
+        assert adapter.send_path_degraded is False
         # getUpdates offset preserved exactly: cold-boot drop_pending honored, probe issued no get_updates.
         app.updater.start_polling.assert_awaited_once()
         assert app.updater.start_polling.await_args.kwargs["drop_pending_updates"] is False
