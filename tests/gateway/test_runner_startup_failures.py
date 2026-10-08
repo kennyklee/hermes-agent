@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -599,3 +601,112 @@ async def test_token_lock_plus_retryable_peer_stays_alive(monkeypatch, tmp_path)
         assert state["platforms"]["discord"]["state"] == "retrying"
     finally:
         await runner.stop()
+
+
+class _CleanExitRunner:
+    """Minimal stand-in for GatewayRunner: ``start()`` succeeds immediately and the gateway reports
+    a clean exit right after, so ``start_gateway`` returns without touching cron/housekeeping."""
+
+    def __init__(self, config):
+        self.config = config
+        self.should_exit_cleanly = True
+        self.exit_reason = None
+        self.exit_code = None
+        self.adapters = {}
+
+    async def start(self):
+        return True
+
+    async def stop(self):
+        return None
+
+
+def _patch_start_gateway_scaffolding(monkeypatch, tmp_path, runner_cls) -> None:
+    """Shared plumbing every ``start_gateway`` test needs so it reaches the code under test."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", runner_cls)
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_runs_in_background_after_platforms_connect(monkeypatch, tmp_path):
+    """Default (fast-boot) order: platforms connect (``runner.start()``) BEFORE MCP discovery even
+    starts, and ``start_gateway`` does not wait for discovery to finish. A slow/unreachable MCP
+    server must not delay Telegram/Slack/Discord coming online. See #16856."""
+    _patch_start_gateway_scaffolding(monkeypatch, tmp_path, _CleanExitRunner)
+    order = []
+    discovery_release = asyncio.Event()
+
+    async def fake_discover(config):
+        order.append("discovery_started")
+        await discovery_release.wait()
+        order.append("discovery_finished")
+
+    class _Runner(_CleanExitRunner):
+        async def start(self):
+            order.append("platforms_connected")
+            return await super().start()
+
+    monkeypatch.setattr("gateway.run.GatewayRunner", _Runner)
+    monkeypatch.setattr("gateway.run._discover_gateway_mcp_tools", fake_discover)
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+    assert ok is True
+    # start_gateway returned without awaiting discovery; let the detached task get its first tick.
+    await asyncio.sleep(0)
+    # Platforms were connected before discovery was even scheduled, and start_gateway returned
+    # without awaiting it (discovery is still parked on the unset event).
+    assert order == ["platforms_connected", "discovery_started"]
+
+    discovery_release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert order[-1] == "discovery_finished"
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_blocks_platform_connect_when_background_disabled(monkeypatch, tmp_path):
+    """Legacy opt-out (``HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND=0``): discovery runs to completion
+    BEFORE platforms connect, preserving the pre-fast-boot ordering for anyone who needs it."""
+    _patch_start_gateway_scaffolding(monkeypatch, tmp_path, _CleanExitRunner)
+    monkeypatch.setenv("HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND", "0")
+    order = []
+
+    async def fake_discover(config):
+        order.append("discovery_started")
+        await asyncio.sleep(0)
+        order.append("discovery_finished")
+
+    class _Runner(_CleanExitRunner):
+        async def start(self):
+            order.append("platforms_connected")
+            return await super().start()
+
+    monkeypatch.setattr("gateway.run.GatewayRunner", _Runner)
+    monkeypatch.setattr("gateway.run._discover_gateway_mcp_tools", fake_discover)
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+    assert ok is True
+    assert order == ["discovery_started", "discovery_finished", "platforms_connected"]
+
+
+def test_startup_mcp_discovery_background_enabled_defaults_true(monkeypatch):
+    from gateway.run import _startup_mcp_discovery_background_enabled
+
+    monkeypatch.delenv("HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND", raising=False)
+    assert _startup_mcp_discovery_background_enabled() is True
+
+    monkeypatch.setenv("HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND", "false")
+    assert _startup_mcp_discovery_background_enabled() is False
+
+    monkeypatch.setenv("HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND", "1")
+    assert _startup_mcp_discovery_background_enabled() is True
