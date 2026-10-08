@@ -6082,6 +6082,49 @@ def _guard_corrupt_user_config() -> None:
         raise SystemExit(2) from exc
 
 
+# Bound on the post-teardown task-cancellation wait in _finalize_gateway_loop. Short because
+# teardown already cancelled every task that matters; this only sweeps leftovers before os._exit.
+_GATEWAY_LOOP_FINALIZE_TIMEOUT = 1.0
+
+
+def _finalize_gateway_loop(loop: "asyncio.AbstractEventLoop",
+                           timeout: float = _GATEWAY_LOOP_FINALIZE_TIMEOUT) -> None:
+    """Best-effort, bounded cancellation of tasks still pending when ``start_gateway`` returns.
+
+    Deliberately OMITS ``asyncio.run``'s ``loop.shutdown_default_executor()`` (and
+    ``shutdown_asyncgens()``), which blocked ~3s on the restart path waiting for default-executor
+    threads / cancellation-swallowing tasks to finish AFTER graceful teardown (SessionDB close,
+    flush, lock release) had already completed. ``_exit_after_graceful_shutdown`` hard-exits via
+    ``os._exit`` right after, discarding the loop and any lingering threads anyway (the same
+    wedge-proof philosophy as #53107), so that wait is pure latency. Cancelling leftover tasks
+    under a short bound lets well-behaved ones finalize without letting a wedged one stall exit."""
+    try:
+        tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    except Exception:
+        return
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    with suppress(Exception):
+        loop.run_until_complete(
+            asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout))
+
+
+def _run_gateway_event_loop(coro):
+    """Run the gateway entrypoint coroutine like ``asyncio.run`` but with ``_finalize_gateway_loop``
+    in place of ``asyncio.run``'s slow teardown, so the restart path exits promptly once teardown
+    is complete. The coroutine's return value propagates (and so does a ``SystemExit`` it raises);
+    ``main`` routes both through the ``os._exit`` backstop, which flushes logs and releases locks."""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        _finalize_gateway_loop(loop)
+        asyncio.set_event_loop(None)
+
+
 def main():
     """CLI entry point for the gateway."""
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
@@ -6161,7 +6204,7 @@ def main():
         # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
         # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
         # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        success = _run_gateway_event_loop(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
