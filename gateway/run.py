@@ -4915,8 +4915,16 @@ _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT = 35.0
 
 # SIGTERM→SIGKILL window for the terminal MCP child-tree reap on the shutdown/restart path. Short so
 # npx→node trees die before Python exits instead of being reaped by the death supervisor / systemd
-# ~3-4s after exit (which left the service cgroup non-empty and stretched the restart).
-_MCP_CHILD_TREE_REAP_GRACE = 1.0
+# ~3-4s after exit (which left the service cgroup non-empty and stretched the restart). 0.5s: on a
+# restart these trees are being killed regardless, SIGKILL is the guaranteed backstop, and a
+# cooperative child honours SIGTERM well inside 0.5s — so a longer grace is pure restart latency.
+_MCP_CHILD_TREE_REAP_GRACE = 0.5
+
+# Cap on how long the shutdown tail waits for the GRACEFUL MCP close before force-reaping. The
+# force-reap below SIGTERM/SIGKILLs and unregisters EVERY tracked tree unconditionally, so this is
+# only "how long to let servers close cleanly first"; a wedged close that would otherwise burn the
+# old 5.0s default is bounded here and the trees still die. Normal closes finish well inside 2.0s.
+_MCP_SHUTDOWN_DRAIN_TIMEOUT = 2.0
 
 
 async def _await_thread_exit(
@@ -5849,7 +5857,8 @@ async def _start_gateway_shutdown_tail(
     # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
     # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
     try:
-        await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+        await _shutdown_mcp_servers_nonblocking(
+            timeout=_MCP_SHUTDOWN_DRAIN_TIMEOUT, config=getattr(runner, "config", None))
     except Exception:
         logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
 
@@ -6049,7 +6058,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             await runner.wait_for_shutdown()
             try:
-                await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+                await _shutdown_mcp_servers_nonblocking(
+                    timeout=_MCP_SHUTDOWN_DRAIN_TIMEOUT, config=getattr(runner, "config", None))
             except Exception:
                 logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
             return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
@@ -6083,8 +6093,12 @@ def _guard_corrupt_user_config() -> None:
 
 
 # Bound on the post-teardown task-cancellation wait in _finalize_gateway_loop. Short because
-# teardown already cancelled every task that matters; this only sweeps leftovers before os._exit.
-_GATEWAY_LOOP_FINALIZE_TIMEOUT = 1.0
+# teardown already cancelled every task that matters; this only sweeps leftovers before os._exit,
+# which discards the loop and any still-pending task anyway. 0.25s: a well-behaved task finalizes on
+# the first cancel in one loop step, so the only thing this bound ever waits out is a
+# cancellation-swallowing task — which os._exit would kill regardless, making a longer wait pure
+# restart latency.
+_GATEWAY_LOOP_FINALIZE_TIMEOUT = 0.25
 
 
 def _finalize_gateway_loop(loop: "asyncio.AbstractEventLoop",
