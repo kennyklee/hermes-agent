@@ -407,3 +407,35 @@ async def test_shutdown_mcp_servers_nonblocking_completes_fast_path():
         done = await gateway_run._shutdown_mcp_servers_nonblocking(timeout=5)
     assert done is True
     assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_mcp_servers_nonblocking_force_reaps_child_trees():
+    """FIX 1: the terminal child-tree reap runs even when the graceful close finished in time,
+    so leftover npx→node trees die before os._exit instead of being reaped ~3-4s after exit."""
+    reaped = []
+    with patch("tools.mcp_tool_lifecycle.shutdown_mcp_servers", lambda **_kw: None), \
+         patch("tools.mcp_tool_lifecycle._force_reap_mcp_child_trees",
+               side_effect=lambda grace=1.0: (reaped.append(grace) or 0)) as mock_reap:
+        done = await gateway_run._shutdown_mcp_servers_nonblocking(timeout=5)
+    assert done is True
+    mock_reap.assert_called_once()
+    # Uses the short shutdown grace, not the 2s default.
+    assert reaped == [gateway_run._MCP_CHILD_TREE_REAP_GRACE]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_mcp_servers_nonblocking_force_reaps_after_abandoned_close():
+    """FIX 1: even when the graceful close is abandoned on timeout, the terminal reap still runs."""
+    def _wedged(**_kwargs):
+        import time as _time
+        _time.sleep(30)
+
+    reaped = []
+    with patch("tools.mcp_tool_lifecycle.shutdown_mcp_servers", _wedged), \
+         patch("tools.mcp_tool_lifecycle._force_reap_mcp_child_trees",
+               side_effect=lambda grace=1.0: (reaped.append(grace) or 2)):
+        done = await asyncio.wait_for(
+            gateway_run._shutdown_mcp_servers_nonblocking(timeout=0.3), timeout=5)
+    assert done is False  # graceful close exceeded its budget and was abandoned
+    assert reaped == [gateway_run._MCP_CHILD_TREE_REAP_GRACE]  # terminal reap still ran

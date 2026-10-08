@@ -4913,6 +4913,11 @@ _CRON_SHUTDOWN_DRAIN_TIMEOUT = 65.0
 # Housekeeping's channel-directory refresh blocks on fut.result(timeout=30); cover that + margin.
 _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT = 35.0
 
+# SIGTERM→SIGKILL window for the terminal MCP child-tree reap on the shutdown/restart path. Short so
+# npx→node trees die before Python exits instead of being reaped by the death supervisor / systemd
+# ~3-4s after exit (which left the service cgroup non-empty and stretched the restart).
+_MCP_CHILD_TREE_REAP_GRACE = 1.0
+
 
 async def _await_thread_exit(
     thread: Optional[threading.Thread], timeout: float, poll: float = 0.1) -> bool:
@@ -4982,6 +4987,19 @@ async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = 
         logger.warning(
             "MCP shutdown did not finish within %.1fs; continuing gateway "
             "teardown (background thread will be reaped at process exit)", timeout)
+    # Guaranteed terminal reap of MCP child TREES. The graceful close above can exhaust its budget
+    # inside the SDK transport close / loop drain and be abandoned before its SIGKILL pass runs,
+    # leaving npx→node trees alive in our cgroup for the death supervisor / systemd to reap ~3-4s
+    # after we exit. SIGTERM the tracked process groups, short grace, SIGKILL — off-loop and
+    # self-bounded — so the cgroup is empty at process exit. No-op when the graceful path already
+    # reaped (ledgers emptied).
+    try:
+        from tools.mcp_tool_lifecycle import _force_reap_mcp_child_trees
+        reaped = await asyncio.to_thread(_force_reap_mcp_child_trees, _MCP_CHILD_TREE_REAP_GRACE)
+        if reaped:
+            logger.info("Force-reaped %d leftover MCP child process tree(s) at gateway shutdown", reaped)
+    except Exception:
+        logger.debug("Terminal MCP child-tree reap failed", exc_info=True)
     return done
 
 
