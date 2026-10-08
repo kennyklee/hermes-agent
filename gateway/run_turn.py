@@ -1409,6 +1409,33 @@ class GatewayTurnMixin:
             )
         return bounded
 
+    def _hmwa_restart_sidecar_note(self, session_key, history, turn_sidecar_notes):
+        """One-shot note on the first turn of a session after the gateway process (re)started.
+
+        A restart between turns (systemd/CLI, not only chat ``/restart``) leaves the agent unaware: its
+        tool list, MCP state and config knowledge are frozen at session start. When a session with
+        history is first seen by THIS process, a restart necessarily happened since its last turn, so say
+        so. In-memory marker => resets naturally on each restart; sidecar delivery => no prompt rebuild.
+        """
+        if not session_key or not history:
+            return
+        seen = self.__dict__.setdefault("_restart_note_seen", set())
+        if session_key in seen:
+            return
+        seen.add(session_key)
+        started = getattr(self, "_startup_time", None)
+        if not started:
+            return
+        try:
+            when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(started))
+        except Exception:
+            return
+        turn_sidecar_notes.append(
+            f"[System note: The Hermes gateway restarted at {when}, after this session's previous turn. "
+            "Earlier statements about uptime, loaded tools, MCP servers or config may be stale; re-check live "
+            "state before asserting it. Tools added or removed by the restart only appear after /reset.]"
+        )
+
     async def _hmwa_first_contact_notes(self, source, history, turn_sidecar_notes):
         """First-ever-message onboarding note + one-time 'no home channel' prompt (both only when
         the session has no history). Delivered on the user message (sidecar), NOT the ephemeral
@@ -2102,6 +2129,7 @@ class GatewayTurnMixin:
             return t("gateway.errors.history_unavailable"), _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes)
+        self._hmwa_restart_sidecar_note(session_key, history, turn_sidecar_notes)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).
