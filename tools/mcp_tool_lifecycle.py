@@ -357,16 +357,19 @@ def _group_alive(pgid: Optional[int], my_pgid: Optional[int]) -> bool:
         return False
 
 
-def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optional[str] = None) -> None:
-    """Best-effort reap of stdio MCP subprocesses: SIGTERM, wait 2s, SIGKILL survivors. By
-    default only ``_orphan_stdio_pids`` are reaped so concurrent cron jobs / live sessions are
-    untouched; ``include_active=True`` also kills every ``_stdio_pids`` entry and is only for
-    final shutdown after the MCP loop has stopped. ``server_name`` limits the sweep to one
-    server (stdio reconnects cleaning up their old transport)."""
+def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optional[str] = None,
+                                grace: float = 2.0) -> int:
+    """Best-effort reap of stdio MCP subprocesses: SIGTERM, wait ``grace`` seconds, SIGKILL
+    survivors. Returns the number of PIDs reaped. By default only ``_orphan_stdio_pids`` are
+    reaped so concurrent cron jobs / live sessions are untouched; ``include_active=True`` also
+    kills every ``_stdio_pids`` entry and is only for final shutdown after the MCP loop has
+    stopped. ``server_name`` limits the sweep to one server (stdio reconnects cleaning up their
+    old transport). ``grace`` is the SIGTERM→SIGKILL window — shortened on the gateway-shutdown
+    path so npx→node trees die before the process exits (``_force_reap_mcp_child_trees``)."""
     import signal as _signal
     pids, pgids, starts = _take_reapable_pids(include_active, server_name)
-    if not pids:  # skip the 2s sleep every MCP-free shutdown would otherwise pay
-        return
+    if not pids:  # skip the grace sleep every MCP-free shutdown would otherwise pay
+        return 0
 
     try:  # our own pgid, so we never killpg() the gateway itself
         my_pgid = os.getpgrp()
@@ -376,7 +379,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
     for pid, owner in pids.items():
         _signal_mcp_process(pid, _signal.SIGTERM, owner, pgids.get(pid), my_pgid, starts.get(pid))
         logger.debug("Sent SIGTERM to orphaned MCP process %d (%s)", pid, owner)
-    time.sleep(2)
+    time.sleep(max(0.0, grace))
     sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
     from gateway.status import _pid_exists  # ``os.kill(pid, 0)`` is NOT a no-op on Windows
     for pid, owner in pids.items():
@@ -386,6 +389,21 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
     # These groups are reaped. Release them last, so a crash partway through the SIGTERM/SIGKILL
     # dance still leaves the supervisor holding them.
     _core._update_death_supervisor("unregister", pgids.values())
+    return len(pids)
+
+
+def _force_reap_mcp_child_trees(grace: float = 1.0) -> int:
+    """Terminal, prompt reap of EVERY tracked stdio MCP child process TREE (active + orphaned):
+    SIGTERM each spawn-time process group (reaching reparented npx→sh→node grandchildren), a short
+    ``grace``, then SIGKILL survivors. Returns the number of PIDs reaped.
+
+    The graceful ``shutdown_mcp_servers`` path can exhaust its budget inside the SDK transport
+    close / loop drain and be abandoned before its own SIGKILL pass runs, leaving child trees
+    alive in the gateway's cgroup for the parent-death supervisor / systemd to reap ~3-4s after
+    the Python process exits. Running this on the shutdown tail leaves the cgroup empty at exit.
+    A no-op (returns 0) when the graceful path already reaped them (ledgers emptied). Blocking
+    (``time.sleep(grace)``) — call off the event loop (e.g. ``asyncio.to_thread``)."""
+    return _kill_orphaned_mcp_children(include_active=True, grace=grace)
 
 
 def _stop_mcp_loop_if_idle() -> bool:
