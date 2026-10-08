@@ -6317,7 +6317,7 @@ def _log_exit_residue(exit_code: int) -> None:
         return
     thread_desc = ", ".join(f"{t.name}#{t.ident}" for t in threads) or "none"
     child_desc = ", ".join(f"{pid}:{name}" for pid, name in children) or "none"
-    logger.debug(
+    logger.info(
         "Gateway hard-exit (code %s) residue: %d non-daemon thread(s) [%s]; %d direct child process(es) [%s]",
         exit_code, len(threads), thread_desc, len(children), child_desc)
 
