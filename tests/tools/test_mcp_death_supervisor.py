@@ -238,6 +238,40 @@ def test_leaves_an_unregistered_group_alone_at_eof():
         supervisor.wait(timeout=10)
 
 
+@pytest.mark.live_system_guard_bypass
+def test_reap_bounds_the_grace_for_a_sigterm_ignoring_group():
+    """A group that ignores SIGTERM is SIGKILLed within the short grace.
+
+    The supervisor is spawned into the gateway's service cgroup, so every second it spends holding a
+    still-registered group during the TERM->KILL grace is a second the cgroup stays non-empty and a
+    systemd restart cannot report "cgroup empty". The grace was shortened from 3.0s to 1.0s; this
+    proves a stubborn (SIGTERM-ignoring) orphan is still reaped, and quickly.
+    """
+    assert mcp_death_supervisor._TERM_GRACE_S <= 1.0
+    victim = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, sys, time\n"
+         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+         "print('ready', flush=True)\n"
+         "time.sleep(300)"],
+        stdout=subprocess.PIPE, text=True,
+        start_new_session=True,  # its own process-group leader, so pgid == pid
+    )
+    try:
+        # Wait until SIG_IGN is installed, else _reap's SIGTERM would win the interpreter-startup race.
+        assert victim.stdout.readline().strip() == "ready"
+        pgid = os.getpgid(victim.pid)
+        started = time.monotonic()
+        mcp_death_supervisor._reap({pgid})
+        elapsed = time.monotonic() - started
+        assert victim.wait(timeout=5) == -signal.SIGKILL, "SIGTERM-ignoring group was not SIGKILLed"
+        # Bounded by the grace (+ poll / scheduling slack); nowhere near the old 3.0s.
+        assert elapsed < 2.0, f"reap grace too long: {elapsed:.2f}s"
+    finally:
+        _kill(victim.pid)
+        victim.wait(timeout=5)
+
+
 # A stand-in for Hermes: registers a real child, then blocks forever holding the
 # only write end of the control pipe. SIGKILLing it is the scenario the whole
 # module exists for -- no cleanup code of ours gets to run.

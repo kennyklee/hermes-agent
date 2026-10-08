@@ -75,8 +75,15 @@ import signal
 import sys
 import time
 
-# Matches the grace period the per-server watchdog used before it escalated.
-_TERM_GRACE_S = 3.0
+# SIGTERM→SIGKILL window for the last-resort reap after the parent (Hermes) has already died.
+# 1.0s, aligned with the gateway's own in-process reap grace (``_MCP_CHILD_TREE_REAP_GRACE`` in
+# gateway/run.py): this process is spawned into the gateway's service cgroup, so while it holds a
+# still-registered group under this grace the cgroup stays non-empty and a systemd restart cannot
+# report "cgroup empty" — a 3.0s grace stretched the observed restart by ~2s. The parent is already
+# gone by the time we reap, so there is no reason to wait long for a cooperative SIGTERM exit; a
+# wedged group gets SIGKILLed either way. The clean-shutdown path unregisters as it tears each server
+# down, so this grace is only ever paid for orphans the gateway's teardown failed to kill.
+_TERM_GRACE_S = 1.0
 # How often we re-check for survivors during that grace period.
 _REAP_POLL_S = 0.1
 # A command is "unregister <pgid>" -- around 20 characters. The cap only has to
