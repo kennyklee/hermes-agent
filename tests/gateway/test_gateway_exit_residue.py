@@ -2,6 +2,7 @@
 slow cgroup-empty on the restart path is diagnosable from logs. Purely observational: it signals nothing
 and kills nothing (background terminal processes are intentionally persisted across a restart)."""
 
+import json
 import logging
 import subprocess
 import sys
@@ -63,3 +64,44 @@ def test_log_exit_residue_is_silent_when_nothing_lingers(monkeypatch, caplog):
     with caplog.at_level(logging.DEBUG, logger=gateway_run.logger.name):
         gateway_run._log_exit_residue(0)
     assert "residue" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_log_exit_residue_writes_to_stderr(monkeypatch, capsys):
+    """The logger.* call is swallowed post-drain on the os._exit path, so the diagnostic MUST also
+    land on stderr (systemd journal) — that is the fix for why it never appeared in production."""
+    monkeypatch.setattr(gateway_run, "_live_nondaemon_threads", lambda: [])
+    monkeypatch.setattr(gateway_run, "_describe_child_pids",
+                        lambda: [(4242, "node .../mcp-remote-env-header.mjs")])
+    gateway_run._log_exit_residue(75)
+    err = capsys.readouterr().err
+    assert "[gateway-exit-residue]" in err
+    assert "hard-exit (code 75) residue" in err
+    assert "4242:node" in err
+
+
+def test_log_exit_residue_appends_to_exit_diag_jsonl(tmp_path, monkeypatch):
+    """Structured record lands in gateway-exit-diag.log — the same durable sink as the CLI's
+    _exit_diag records — so a slow cgroup-empty is forensically reconstructable after os._exit."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_live_nondaemon_threads", lambda: [])
+    monkeypatch.setattr(gateway_run, "_describe_child_pids",
+                        lambda: [(4242, "node .../mcp-remote-env-header.mjs")])
+    gateway_run._log_exit_residue(75)
+    diag = tmp_path / "logs" / "gateway-exit-diag.log"
+    assert diag.exists(), "exit-diag JSONL was not written"
+    records = [json.loads(line) for line in diag.read_text(encoding="utf-8").splitlines() if line.strip()]
+    residue = [r for r in records if r.get("tag") == "gateway.exit_residue"]
+    assert residue, f"no gateway.exit_residue record in {records}"
+    rec = residue[-1]
+    assert rec["exit_code"] == 75
+    assert rec["child_pids"] == [{"pid": 4242, "cmd": "node .../mcp-remote-env-header.mjs"}]
+    assert rec["nondaemon_threads"] == []
+
+
+def test_log_exit_residue_jsonl_silent_when_nothing_lingers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_live_nondaemon_threads", lambda: [])
+    monkeypatch.setattr(gateway_run, "_describe_child_pids", lambda: [])
+    gateway_run._log_exit_residue(0)
+    diag = tmp_path / "logs" / "gateway-exit-diag.log"
+    assert not diag.exists() or "gateway.exit_residue" not in diag.read_text(encoding="utf-8")

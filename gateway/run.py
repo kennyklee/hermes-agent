@@ -6303,23 +6303,51 @@ def _describe_child_pids() -> list:
 
 
 def _log_exit_residue(exit_code: int) -> None:
-    """DEBUG snapshot of what is still alive at the hard-exit backstop, so a slow cgroup-empty on the
+    """Snapshot of what is still alive at the hard-exit backstop, so a slow cgroup-empty on the
     restart path is diagnosable from logs rather than guesswork: live non-daemon threads (interpreter
     finalization would join these) and leftover direct child PIDs with cmdlines (systemd / the
     parent-death supervisor reap these after we exit). Purely observational — it signals nothing and
     kills nothing. A blanket child-reap here is deliberately NOT done: background ``terminal`` processes
     are intentionally persisted across a gateway restart (process_registry checkpoint + re-adoption),
     so killing every child would regress that; the targeted reap belongs with whichever tool owns the
-    leftover tree, and this line is what identifies it in production."""
+    leftover tree, and this line is what identifies it in production.
+
+    Durability: this runs from ``_exit_after_graceful_shutdown`` AFTER the bounded log drain and right
+    before ``os._exit``. A ``logger.*`` call here is enqueued behind an already-stopped ``QueueListener``
+    and silently discarded — which is exactly why this line never reached ``agent.log`` or the journal on
+    the restart path. So the diagnostic is written where ``os._exit`` cannot swallow it: straight to
+    ``stderr`` (captured by the systemd journal) and appended to the ``gateway-exit-diag.log`` JSONL, the
+    same durable sink the CLI's ``_exit_diag`` records use. The ``logger.info`` is kept too — harmless and
+    useful for in-process callers/tests — but is NOT what makes the line land in production."""
     threads = _live_nondaemon_threads()
     children = _describe_child_pids()
     if not threads and not children:
         return
     thread_desc = ", ".join(f"{t.name}#{t.ident}" for t in threads) or "none"
     child_desc = ", ".join(f"{pid}:{name}" for pid, name in children) or "none"
-    logger.info(
-        "Gateway hard-exit (code %s) residue: %d non-daemon thread(s) [%s]; %d direct child process(es) [%s]",
-        exit_code, len(threads), thread_desc, len(children), child_desc)
+    message = (
+        "Gateway hard-exit (code %s) residue: %d non-daemon thread(s) [%s]; %d direct child process(es) [%s]"
+        % (exit_code, len(threads), thread_desc, len(children), child_desc))
+    # logger.* is swallowed post-drain on the os._exit path (see docstring); kept for in-process callers.
+    logger.info(message)
+    # stderr → systemd journal: lands regardless of the log-queue state.
+    with suppress(Exception):
+        sys.stderr.write("[gateway-exit-residue] " + message + "\n")
+        sys.stderr.flush()
+    # gateway-exit-diag.log JSONL: same durable, structured sink as the CLI's _exit_diag records.
+    with suppress(Exception):
+        from datetime import datetime, timezone
+        from gateway.lifecycle_ledger import _append_exit_diag
+        _append_exit_diag({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "tag": "gateway.exit_residue",
+            "pid": os.getpid(),
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "exit_code": exit_code,
+            "nondaemon_threads": [f"{t.name}#{t.ident}" for t in threads],
+            "child_pids": [{"pid": pid, "cmd": name} for pid, name in children],
+        }, None)
 
 
 if __name__ == "__main__":
