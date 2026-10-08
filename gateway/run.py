@@ -961,6 +961,15 @@ def _startup_warmup_timeout_secs() -> float:
     return _float_env("HERMES_STARTUP_WARMUP_TIMEOUT", _STARTUP_WARMUP_TIMEOUT_SECS_DEFAULT)
 
 
+def _startup_mcp_discovery_background_enabled() -> bool:
+    """Whether startup MCP discovery runs in the background, after platforms connect (default), or
+    blocks platform connects the old way (``agent.gateway_startup_mcp_discovery_background: false``
+    / ``HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND=0``). See #16856: discover_mcp_tools()'s internal
+    120s per-server wait used to sit between plugin discovery and the platforms connecting."""
+    from utils import env_var_enabled
+    return env_var_enabled("HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND", default="true")
+
+
 def _warm_turn_machinery_sync() -> int:
     """Synchronously initialize first-turn prerequisites (executor thread); returns the schema count.
 
@@ -1984,7 +1993,8 @@ _AGENT_ENV_BRIDGE = {
     "cron_drain_timeout": "HERMES_CRON_DRAIN_TIMEOUT",
     "gateway_auto_continue_freshness": "HERMES_AUTO_CONTINUE_FRESHNESS",
     "gateway_startup_restore_drain_timeout": "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT",
-    "gateway_startup_warmup_timeout": "HERMES_STARTUP_WARMUP_TIMEOUT"}
+    "gateway_startup_warmup_timeout": "HERMES_STARTUP_WARMUP_TIMEOUT",
+    "gateway_startup_mcp_discovery_background": "HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND"}
 # config-authoritative knobs for the session-search index (env stays the cross-process carrier).
 _SESSIONS_ENV_BRIDGE = {"cjk_fts": "HERMES_CJK_FTS", "search_slow_ms": "HERMES_SEARCH_SLOW_MS"}
 _DISPLAY_ENV_BRIDGE = {
@@ -3416,6 +3426,7 @@ class GatewayRunner(
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
     _startup_warmup_task: Optional[asyncio.Task] = None
+    _startup_mcp_discovery_task: Optional[asyncio.Task] = None
 
     # Legacy per-session dict attrs as LIVE views over ``self._sessions``; new code: _session_state(key)
     _running_agents = legacy_dict_property("_running_agents")
@@ -5951,14 +5962,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _ensure_windows_gateway_venv_imports()
 
     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
-    try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+    async def _run_startup_mcp_discovery() -> None:
+        try:
+            # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
+            # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
+            # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
+            # Telegram polling) until it returned. See #16856.
+            await _discover_gateway_mcp_tools(runner.config)
+        except Exception as e:
+            logger.debug("MCP tool discovery failed: %s", e)
+
+    _mcp_discovery_background = _startup_mcp_discovery_background_enabled()
+    if not _mcp_discovery_background:
+        # Legacy order: block platform connects on discovery (opt out via
+        # agent.gateway_startup_mcp_discovery_background: false / HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND=0).
+        await _run_startup_mcp_discovery()
 
     try:
         success = await runner.start()
@@ -5968,6 +5986,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not success:
         _shutdown_gateway_health_export(runner)
         return False
+
+    if _mcp_discovery_background:
+        # Platforms are connected; discover MCP tools off the hot path instead — a slow/unreachable
+        # server (npx mcp-remote et al.) no longer delays Telegram/Slack/Discord coming online (observed
+        # ~140s on one production restart). Tools appear once discovery finishes: the cached-agent
+        # signature includes tools.registry_generation (gateway/run_agent_cache.py), so the next turn in
+        # any session rebuilds and picks them up — the same mechanism /reload-mcp relies on. A turn that
+        # starts before discovery completes simply runs without those MCP tools this once.
+        runner._startup_mcp_discovery_task = asyncio.ensure_future(_run_startup_mcp_discovery())
 
     def _recover_pending() -> None:
         recovered = _recover_pending_flushes(runner)

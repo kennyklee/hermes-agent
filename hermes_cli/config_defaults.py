@@ -267,6 +267,15 @@ DEFAULT_CONFIG = {
         # message isn't served with a skeleton system prompt. On timeout the gate opens and warm-up
         # finishes in the background. 0 = disable warm-up (lazy init).
         "gateway_startup_warmup_timeout": 20,
+        # Run startup MCP discovery in the background, after platforms connect, instead of blocking
+        # them on it. discover_mcp_tools() has an internal 120s wait per slow/unreachable server
+        # (npx mcp-remote et al.), which used to sit between the plugin-discovery log line and
+        # "Connecting to telegram..." — ~140s of Telegram/Slack/Discord being offline on a single
+        # restart. Tools appear once discovery finishes: the cached-agent signature includes
+        # tools.registry_generation (gateway/run_agent_cache.py), so the next turn in any session
+        # rebuilds and picks them up, the same mechanism /reload-mcp relies on. False restores the
+        # old blocking order. HERMES_STARTUP_MCP_DISCOVERY_BACKGROUND overrides.
+        "gateway_startup_mcp_discovery_background": True,
         # Stale-stream ceiling (seconds) for local providers (Ollama, oMLX, llama-cpp). Applied when
         # the base stale timeout is at its 180s default and a local endpoint is detected, so a
         # wedged local server eventually trips the detector instead of hanging forever. Env
