@@ -1313,6 +1313,49 @@ class TelegramAdapter(BasePlatformAdapter):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
 
+    def _schedule_fallback_ip_discovery(self) -> None:
+        """Refresh Telegram fallback IPs via DoH OFF the cold-connect critical path.
+
+        Cold connect starts with ``SEED_FALLBACK_IPS`` (known-good Bot API endpoints — exactly what
+        the transport fell back to when the old inline discovery timed out), so DoH no longer blocks
+        the connect banner by ~0.4–0.8s (up to its multi-second timeout). This runs discovery in a
+        tracked background task and caches a genuinely-discovered (non-seed) result on ``self`` for
+        the NEXT ``_build_ptb_requests`` / reconnect. Idempotent: skips when a non-seed result is
+        already cached or a discovery is in flight; a seed-equal result is not cached so a later
+        reconnect retries DoH. Bounded by ``HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT`` (finite
+        default) and cancelled with the adapter's other ``_background_tasks`` on teardown."""
+        if getattr(self, "_discovered_fallback_ips", None):
+            return
+        in_flight = getattr(self, "_fallback_discovery_task", None)
+        if in_flight is not None and not in_flight.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover — connect always runs on a loop
+            return
+        timeout = self._env_float_clamped(
+            "HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT", 5.0, min_value=0.0) or 5.0
+
+        async def _discover() -> None:
+            try:
+                ips = await asyncio.wait_for(discover_fallback_ips(), timeout=timeout)
+            except Exception as exc:
+                logger.debug("[%s] Background Telegram fallback-IP discovery did not complete: %s",
+                             self.name, _redact_telegram_error_text(exc))
+                return
+            # discover_fallback_ips() floors to SEED_FALLBACK_IPS; only a genuinely-discovered set is
+            # worth caching (seeds are already the cold-connect default), so a seed-equal result is
+            # left uncached to let a later reconnect retry DoH.
+            if ips and list(ips) != list(SEED_FALLBACK_IPS):
+                self._discovered_fallback_ips = list(ips)
+                logger.info("[%s] Background-discovered Telegram fallback IPs (used on next reconnect): %s",
+                            self.name, ", ".join(ips))
+
+        task = loop.create_task(_discover())
+        self._fallback_discovery_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
         text = str(error).lower()
@@ -3134,18 +3177,20 @@ class TelegramAdapter(BasePlatformAdapter):
         disable_fallback = os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"}
         fallback_ips = [] if disable_fallback else self._fallback_ips()
         if not fallback_ips and not disable_fallback:
-            discovery_timeout = self._env_float_clamped("HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT", 5.0, min_value=0.0)
-            logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
-            try:
-                fallback_ips = await _await_with_thread_deadline(discover_fallback_ips(), timeout=discovery_timeout)
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Telegram fallback-IP discovery failed after %.0fs; "
-                    "using seed IPv4 Telegram API IPs so a blackholed IPv6 hostname path cannot hang initialize() (#87015): %s",
-                    self.name, discovery_timeout, _redact_telegram_error_text(exc))
-                fallback_ips = list(SEED_FALLBACK_IPS)
+            # DoH discovery is NOT awaited on the cold-connect critical path. SEED_FALLBACK_IPS are
+            # known-good Bot API endpoints — exactly what the old inline path fell back to on
+            # discovery timeout/failure — so starting with them lets connect proceed immediately
+            # while DoH refreshes the list in the background for the next (re)connect. A completed
+            # prior discovery (non-seed) is reused directly. The transport still tries the dual-stack
+            # hostname last, so a blackholed IPv6 path cannot pin initialize() (#87015) — robustness
+            # is unchanged; only the ~0.4–0.8s (up to multi-second) inline wait is removed.
+            discovered = getattr(self, "_discovered_fallback_ips", None)
+            if discovered:
+                fallback_ips = list(discovered)
+                logger.info("[%s] Telegram fallback IPs (background-discovered): %s", self.name, ", ".join(fallback_ips))
             else:
-                logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
+                fallback_ips = list(SEED_FALLBACK_IPS)
+                self._schedule_fallback_ip_discovery()
         proxy_url = resolve_proxy_url(
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
