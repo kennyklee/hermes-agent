@@ -305,6 +305,15 @@ gateway:
     none_connected: "Níl aon fhreastalaí MCP ceangailte."
     tools_available: "\n🔧 {tools} uirlis(í) ar fáil ó {servers} freastalaí(thí)"
     failed: "❌ Theip ar athlódáil MCP: {error}"
+  reload_platform:
+    usage: "Úsáid: /reload-platform <name> — athcheangail aon chomhoiriúnóir ardáin le cumraíocht úr (gan an gateway a atosú)."
+    not_connected: "Níl aon chomhoiriúnóir beo ag {name} le hathlódáil (níl sé cumasaithe, nó is le próifíl thánaisteach é). Úsáid `/platform list` chun stádas na n-ardán a fheiceáil."
+    queued: "Tá {name} i scuaine na hathcheangailte cheana féin — tá an faireoir á atriail. Úsáid `/platform resume {name}` nó `hermes gateway restart`."
+    disabled: "Tá {name} díchumasaithe in config.yaml — níl aon rud le hathlódáil. Cumasaigh é, ansin `hermes gateway restart`."
+    config_error: "❌ Níorbh fhéidir an chumraíocht do {name} a athlódáil: {error}"
+    reloaded: "✓ {name} athlódáilte le cumraíocht úr agus athcheangailte."
+    retrying: "⚠️ Athlódáladh {name} ach níor athcheangail sé láithreach — ag atriail sa chúlra. Seiceáil `/platform list`."
+    failed: "❌ Theip ar /reload-platform {name}: {error}"
   reload_skills:
     header: "🔄 **Scileanna Athlódáilte**\n"
     no_new: "Níor braitheadh aon scil nua."

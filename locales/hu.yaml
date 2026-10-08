@@ -308,6 +308,15 @@ gateway:
     none_connected: "Nincsenek csatlakoztatott MCP-szerverek."
     tools_available: "\n🔧 {tools} eszköz érhető el {servers} szerverről"
     failed: "❌ MCP újratöltés sikertelen: {error}"
+  reload_platform:
+    usage: "Használat: /reload-platform <name> — egy platformadapter újracsatlakoztatása friss konfigurációval (gateway-újraindítás nélkül)."
+    not_connected: "{name} nem rendelkezik élő adapterrel az újratöltéshez (nincs engedélyezve, vagy másodlagos profilhoz tartozik). Használd a `/platform list` parancsot a platformok állapotának megtekintéséhez."
+    queued: "{name} már az újracsatlakozási sorban van — a figyelő újrapróbálkozik vele. Használd a `/platform resume {name}` vagy a `hermes gateway restart` parancsot."
+    disabled: "{name} le van tiltva a config.yaml fájlban — nincs mit újratölteni. Engedélyezd, majd `hermes gateway restart`."
+    config_error: "❌ Nem sikerült újratölteni a konfigurációt ehhez: {name}: {error}"
+    reloaded: "✓ {name} újratöltve friss konfigurációval és újracsatlakoztatva."
+    retrying: "⚠️ {name} újratöltve, de nem csatlakozott újra azonnal — újrapróbálkozás a háttérben. Ellenőrizd: `/platform list`."
+    failed: "❌ /reload-platform {name} sikertelen: {error}"
   reload_skills:
     header: "🔄 **Készségek újratöltve**\n"
     no_new: "Nem észleltünk új készséget."

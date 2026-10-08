@@ -305,6 +305,15 @@ gateway:
     none_connected: "Geen MCP-bedieners verbind nie."
     tools_available: "\n🔧 {tools} gereedskap beskikbaar van {servers} bediener(s)"
     failed: "❌ MCP-herlaai het misluk: {error}"
+  reload_platform:
+    usage: "Gebruik: /reload-platform <name> — herverbind een platform-adapter met vars konfigurasie (geen gateway-herbegin nie)."
+    not_connected: "{name} het geen lewende adapter om te herlaai nie (nie geaktiveer nie, of besit deur 'n sekondêre profiel). Gebruik `/platform list` om platformstatus te sien."
+    queued: "{name} is reeds in die herverbind-tou — die waghouer probeer dit weer. Gebruik `/platform resume {name}` of `hermes gateway restart`."
+    disabled: "{name} is in config.yaml gedeaktiveer — niks om te herlaai nie. Aktiveer dit, dan `hermes gateway restart`."
+    config_error: "❌ Kon nie konfigurasie vir {name} herlaai nie: {error}"
+    reloaded: "✓ {name} herlaai met vars konfigurasie en herverbind."
+    retrying: "⚠️ {name} herlaai maar het nie dadelik herverbind nie — probeer weer in die agtergrond. Kyk `/platform list`."
+    failed: "❌ /reload-platform {name} het misluk: {error}"
   reload_skills:
     header: "🔄 **Vaardighede herlaai**\n"
     no_new: "Geen nuwe vaardighede opgespoor nie."
