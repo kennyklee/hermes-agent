@@ -2075,6 +2075,11 @@ class TelegramAdapter(BasePlatformAdapter):
             probe_exc = probe_wait.exception()
             if probe_exc is None:
                 # getMe confirmed the transport; the background progress verifier now owns getUpdates health.
+                # getMe rides the same bot HTTP client as sendMessage, so the SEND path is proven: clear the
+                # degraded flag now, else outbound sends (restart notice, replies) are refused with
+                # send_path_degraded until the first idle long poll returns ~10s later. Polling-death sites
+                # re-set it if getUpdates later turns out to be wedged.
+                self._send_path_degraded = False
                 logger.info(
                     "[%s] Telegram connect confirmed via getMe bootstrap probe; getUpdates progress "
                     "verified in the background (generation %d)", self.name, getattr(self, "_polling_generation", 0))
