@@ -431,6 +431,10 @@ def _rich_normalize_linebreaks(text: str) -> str:
 # socket PTB's polling task is blocked on in epoll.
 _UPDATER_STOP_TIMEOUT = 15.0  # `await updater.stop()`, applied identically at every site
 _DISCONNECT_STEP_TIMEOUT = 2.0  # other disconnect() steps: short, so a swallowed cancel can't burn the fatal budget
+# disconnect() only: grace for the in-flight getUpdates long poll to return on its own before we abort its
+# HTTP request so updater.stop() need not wait out the ~10s server-side poll timeout (~3.5s observed on a
+# production restart). Steady-state polling timeout is untouched. See _stop_updater_for_shutdown.
+_SHUTDOWN_LONG_POLL_GRACE = 0.5
 _UPDATER_START_TIMEOUT = 30.0  # start_polling() can hang on a degraded pool after a drain
 # Initial connect is unhealthy until getUpdates completes one round trip; bootstrap fails closed so
 # GatewayRunner disposes the adapter and retries fresh.
@@ -3465,6 +3469,55 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._await_disconnect_step(task, _DISCONNECT_STEP_TIMEOUT, label)
         setattr(self, attr, None)
 
+    async def _abort_inflight_getupdates(self) -> None:
+        """Close the getUpdates HTTP request (PTB 22.x ``bot._request[0]``) so an in-flight long
+        poll errors out immediately. Shutdown-only (no re-initialize): the client is being torn
+        down. Offset-safe — an aborted poll acknowledges nothing to Telegram."""
+        if not (self._app and self._app.bot):
+            return
+        try:
+            polling_req = self._app.bot._request[0]  # noqa: SLF001 — PTB 22.x (get_updates, general) tuple
+        except Exception:
+            return
+        if not await self._bounded_request_step(
+                polling_req.shutdown(), "Polling request abort failed/timed out during disconnect (non-fatal)"):
+            # aclose() hung on a CLOSE-WAIT socket; swap in a fresh client so app.shutdown() below
+            # does not re-block on the same dead one.
+            self._orphan_and_rebuild_polling_client(polling_req)
+
+    async def _stop_updater_for_shutdown(self) -> None:
+        """``updater.stop()`` without waiting out the in-flight getUpdates long poll.
+
+        PTB's ``stop()`` returns only once the polling loop's current getUpdates completes, which
+        blocks up to the ~10s server-side long-poll timeout (~3.5s observed on a production
+        restart). Start ``stop()``, give the poll a brief grace to return on its own, then abort
+        the getUpdates HTTP request so the long poll errors out and ``stop()`` completes promptly.
+
+        Offset-safe: an aborted poll acknowledges nothing to Telegram, so any unreceived or
+        unconfirmed updates are simply redelivered on the next boot (``drop_pending_on_cold_boot``
+        handling) — no update is dropped and the offset never advances past an unprocessed update.
+        Falls through on the outer timeout exactly as the direct ``updater.stop()`` did (#80598)."""
+        stop_task = asyncio.ensure_future(self._app.updater.stop())
+        try:
+            await asyncio.wait({stop_task}, timeout=_SHUTDOWN_LONG_POLL_GRACE)
+            if not stop_task.done():
+                logger.info(
+                    "[%s] updater.stop() still blocked on the in-flight getUpdates long poll; "
+                    "aborting the polling request to unblock shutdown", self.name)
+                await self._abort_inflight_getupdates()
+        except Exception as abort_error:  # abort is best-effort; still await stop() below
+            logger.debug(
+                "[%s] aborting in-flight getUpdates during disconnect failed: %s",
+                self.name, _redact_telegram_error_text(abort_error))
+        if not stop_task.done():
+            try:
+                await self._await_disconnect_step(
+                    asyncio.shield(stop_task), _UPDATER_STOP_TIMEOUT, "updater.stop()")
+            except Exception as stop_error:
+                logger.warning(
+                    "[%s] updater.stop() failed during disconnect: %s",
+                    self.name, _redact_telegram_error_text(stop_error))
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
         # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
@@ -3513,11 +3566,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
                 if self._app.updater and self._app.updater.running:
-                    try:
-                        await self._await_disconnect_step(self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
-                    except Exception as stop_error:
-                        logger.warning(
-                            "[%s] updater.stop() failed during disconnect: %s", self.name, _redact_telegram_error_text(stop_error))
+                    await self._stop_updater_for_shutdown()
                 # app.stop()/shutdown() can also block on a half-dead httpx pool.
                 # Detach-on-timeout so disconnect always returns (#80598).
                 if self._app.running:
