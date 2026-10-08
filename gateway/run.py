@@ -6255,7 +6255,71 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
 
     for _step in (_release_locks, _mark_exited, _drain_logs):
         _best_effort(_step)
+    _best_effort(lambda: _log_exit_residue(exit_code))
     os._exit(exit_code)
+
+
+def _live_nondaemon_threads() -> list:
+    """Non-daemon threads still alive besides the current one. These are exactly the threads a clean
+    interpreter finalization (``Py_FinalizeEx``, which ``os._exit`` deliberately bypasses) would have
+    to join — so a lingering one here is a candidate for a slow exit. Best-effort; never raises."""
+    current = threading.current_thread()
+    out: list = []
+    try:
+        for th in threading.enumerate():
+            if th is current or th.daemon or not th.is_alive():
+                continue
+            out.append(th)
+    except Exception:
+        pass
+    return out
+
+
+def _describe_child_pids() -> list:
+    """``(pid, short cmdline)`` for our live direct children — the processes that keep the service
+    cgroup non-empty after ``os._exit``, so systemd / the parent-death supervisor reap them (observed
+    stretching a restart ~3-4s past the Python exit). Best-effort; never raises."""
+    try:
+        from tools.mcp_tool_lifecycle import _snapshot_child_pids
+        pids = _snapshot_child_pids()
+    except Exception:
+        return []
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+    described: list = []
+    for pid in sorted(pids):
+        name = "?"
+        if psutil is not None:
+            try:
+                proc = psutil.Process(pid)
+                argv = proc.cmdline()
+                name = (" ".join(argv)[:160] if argv else proc.name())
+            except Exception:
+                name = "?"
+        described.append((pid, name))
+    return described
+
+
+def _log_exit_residue(exit_code: int) -> None:
+    """DEBUG snapshot of what is still alive at the hard-exit backstop, so a slow cgroup-empty on the
+    restart path is diagnosable from logs rather than guesswork: live non-daemon threads (interpreter
+    finalization would join these) and leftover direct child PIDs with cmdlines (systemd / the
+    parent-death supervisor reap these after we exit). Purely observational — it signals nothing and
+    kills nothing. A blanket child-reap here is deliberately NOT done: background ``terminal`` processes
+    are intentionally persisted across a gateway restart (process_registry checkpoint + re-adoption),
+    so killing every child would regress that; the targeted reap belongs with whichever tool owns the
+    leftover tree, and this line is what identifies it in production."""
+    threads = _live_nondaemon_threads()
+    children = _describe_child_pids()
+    if not threads and not children:
+        return
+    thread_desc = ", ".join(f"{t.name}#{t.ident}" for t in threads) or "none"
+    child_desc = ", ".join(f"{pid}:{name}" for pid, name in children) or "none"
+    logger.debug(
+        "Gateway hard-exit (code %s) residue: %d non-daemon thread(s) [%s]; %d direct child process(es) [%s]",
+        exit_code, len(threads), thread_desc, len(children), child_desc)
 
 
 if __name__ == "__main__":
