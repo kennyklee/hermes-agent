@@ -5008,6 +5008,19 @@ async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = 
             logger.info("Force-reaped %d leftover MCP child process tree(s) at gateway shutdown", reaped)
     except Exception:
         logger.debug("Terminal MCP child-tree reap failed", exc_info=True)
+    # Terminal teardown of the shared parent-death supervisor. The force-reap above already SIGKILLed
+    # every tracked tree, so closing the supervisor's control pipe makes its EOF reap find only dead
+    # groups and exit in milliseconds — instead of lingering in our systemd service cgroup until
+    # os._exit finally closes the pipe (observed holding the cgroup non-empty ~2.8s and stretching the
+    # restart). The release-on-empty path in _update_death_supervisor only fires when an unregister
+    # empties the set; a force-reap that found nothing to reap (ledgers already drained) never reaches
+    # it, so this unconditional call is what guarantees the supervisor is gone before exit. Bounded and
+    # off-loop; crash-safety is unchanged (an ungraceful death still reaps via the pipe's EOF).
+    try:
+        from tools.mcp_tool_common import _core
+        await asyncio.to_thread(_core.shutdown_death_supervisor)
+    except Exception:
+        logger.debug("Death-supervisor terminal teardown failed", exc_info=True)
     return done
 
 

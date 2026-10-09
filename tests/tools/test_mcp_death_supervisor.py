@@ -497,6 +497,74 @@ def test_supervisor_survives_the_real_eof_release():
         child.wait(timeout=10)
 
 
+def test_shutdown_death_supervisor_closes_the_pipe_and_reaps_the_handle(monkeypatch, all_groups_alive):
+    """The terminal clean-exit call closes the control pipe (EOF → the supervisor reaps survivors and
+    exits), waits briefly, and drops all state — so nothing lingers in the service cgroup past exit."""
+    fake = _FakeSupervisor()
+    monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", lambda: fake)
+
+    mcp_tool._update_death_supervisor("register", [111, 222])
+    assert mcp_tool._death_supervisor is fake and mcp_tool._supervised_pgids == {111, 222}
+
+    mcp_tool.shutdown_death_supervisor()
+
+    assert fake.closed, "the control pipe was not closed, so the supervisor never got its EOF"
+    assert getattr(fake, "waited", False), "the exited supervisor was not wait()ed → zombie"
+    assert mcp_tool._death_supervisor is None
+    assert mcp_tool._supervised_pgids == set()
+
+
+def test_shutdown_death_supervisor_uses_a_short_bounded_wait(monkeypatch, all_groups_alive):
+    """A still-reaping supervisor must not block gateway exit: the wait is capped at the short
+    _DEATH_SUPERVISOR_EXIT_WAIT_S, never the old unbounded 5.0s."""
+    waited_with = {}
+
+    class _SlowSupervisor(_FakeSupervisor):
+        def wait(self, timeout=None):
+            waited_with["timeout"] = timeout
+            return 0
+
+    fake = _SlowSupervisor()
+    monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", lambda: fake)
+    mcp_tool._update_death_supervisor("register", [111])
+
+    mcp_tool.shutdown_death_supervisor()
+
+    assert waited_with["timeout"] == mcp_tool._DEATH_SUPERVISOR_EXIT_WAIT_S
+    assert mcp_tool._DEATH_SUPERVISOR_EXIT_WAIT_S <= 0.5, "exit wait must stay small"
+
+
+def test_shutdown_death_supervisor_is_a_noop_with_nothing_running():
+    """Idempotent and safe when no supervisor was ever started (MCP-free gateway)."""
+    assert mcp_tool._death_supervisor is None
+    mcp_tool.shutdown_death_supervisor()  # must not raise
+    assert mcp_tool._death_supervisor is None
+
+
+def test_shutdown_death_supervisor_exits_a_real_supervisor_and_reaps_a_live_group():
+    """End to end: a registered, still-alive group is reaped and the real supervisor exits promptly on
+    the terminal clean-exit call — the clean path must not depend on os._exit closing the pipe."""
+    if os.name != "posix":
+        pytest.skip("POSIX-only supervisor")
+    victim = subprocess.Popen(_VICTIM, start_new_session=True)
+    try:
+        mcp_tool._update_death_supervisor("register", [os.getpgid(victim.pid)])
+        proc = mcp_tool._death_supervisor
+        assert proc is not None and proc.poll() is None
+
+        started = time.monotonic()
+        mcp_tool.shutdown_death_supervisor(timeout=10)
+        elapsed = time.monotonic() - started
+
+        assert mcp_tool._death_supervisor is None
+        assert proc.poll() is not None, "supervisor did not exit on the terminal teardown EOF"
+        assert _wait_exited(victim), "registered group survived the terminal supervisor teardown"
+        assert elapsed < 5.0, f"terminal teardown took too long: {elapsed:.2f}s"
+    finally:
+        _kill(victim.pid)
+        victim.wait(timeout=10)
+
+
 def test_unregister_alone_does_not_start_a_supervisor(monkeypatch):
     spawned = []
     monkeypatch.setattr(

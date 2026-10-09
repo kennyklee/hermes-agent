@@ -538,6 +538,15 @@ _death_supervisor_lock = threading.Lock()
 # Groups the supervisor is reaping on our behalf; replayed verbatim on respawn so a respawn never
 # silently drops coverage for servers that are still running.
 _supervised_pgids: set = set()
+# How long we wait for the supervisor to finish reaping and exit after we close its control pipe
+# (release-on-empty, or the terminal ``shutdown_death_supervisor`` on a clean gateway exit). Short on
+# purpose: by the time we close the pipe the graceful + force-reap passes have already SIGKILLed every
+# MCP child tree, so the supervisor's EOF reap finds only dead groups (``killpg`` → ProcessLookupError,
+# never entering the grace loop) and exits in milliseconds. A genuinely-alive orphan makes it spend its
+# own TERM→grace→KILL window; we do NOT block gateway exit on that — os._exit leaves it to finish and
+# exit on its own, exactly as on an ungraceful death. Replaces an unbounded 5.0s ``wait`` that could
+# re-stretch the restart if the supervisor was mid-reap.
+_DEATH_SUPERVISOR_EXIT_WAIT_S = 0.3
 
 
 def _spawn_death_supervisor():
@@ -642,10 +651,50 @@ def _update_death_supervisor(verb: str, pgids) -> None:
                 pass
             # Reap it, or the exited supervisor stays a zombie until the next Popen in this process.
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=_DEATH_SUPERVISOR_EXIT_WAIT_S)
             except Exception:  # noqa: BLE001 - timeout or already gone; either way we drop it
                 pass
             _death_supervisor = None
+
+
+def shutdown_death_supervisor(timeout: float = _DEATH_SUPERVISOR_EXIT_WAIT_S) -> None:
+    """Terminal teardown of the shared parent-death supervisor on a clean gateway exit.
+
+    Closing our write end of its control pipe is the same EOF its parent's death sends: the
+    supervisor reaps whatever is still registered — dead groups are skipped instantly, a
+    genuinely-alive orphan gets the TERM→grace→KILL sweep — and exits. On a clean shutdown the
+    graceful close + force-reap passes have already killed every MCP child tree, so nothing is left
+    registered-and-alive and it exits within milliseconds. That is the whole point: an untouched
+    supervisor sits in our systemd service cgroup until ``os._exit`` finally closes the pipe, holding
+    the cgroup non-empty and stretching the restart (observed ~2.8s past the Python exit).
+
+    Unlike the release-on-empty path in ``_update_death_supervisor``, this does NOT require the
+    registration set to have been emptied first — it is the belt-and-suspenders call for the clean
+    exit path, where a force-reap that found nothing to reap (ledgers already drained) would otherwise
+    never close the pipe and leave the supervisor blocked on ``readline`` until os._exit.
+
+    Bounded and best-effort. A still-reaping supervisor is not waited out past ``timeout`` — we drop
+    our handle and let it finish reaping and exit on its own. Crash-safety is unchanged: this only runs
+    on the graceful path; a SIGKILLed gateway never reaches it and the supervisor still reaps via the
+    pipe's EOF.
+    """
+    if os.name != "posix":
+        return
+    global _death_supervisor
+    with _death_supervisor_lock:
+        proc = _death_supervisor
+        _death_supervisor = None
+        _supervised_pgids.clear()
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.stdin.close()  # EOF: the supervisor reaps any survivors and exits
+    except (BrokenPipeError, ValueError, OSError):
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except Exception:  # noqa: BLE001 - timeout (still reaping a live orphan) or gone; drop it either way
+        pass
 
 
 def _mcp_registry_scope() -> Optional[str]:
