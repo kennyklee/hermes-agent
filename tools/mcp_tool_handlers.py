@@ -563,6 +563,31 @@ def _render_call_tool_result(result, server_name: str, image_paths: Optional[lis
         return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
+_RECEIPT_KEEP = ("slug", "status", "state", "request_id", "source_id", "noop", "chunks", "embedding_state")
+
+
+def _compact_write_receipt(rendered: str) -> str:
+    """Opt-in (``mcp_servers.<name>.compact_write_results: true``): collapse a verbose write
+    receipt (a JSON object carrying ``request_id`` plus ``slug``/``outcome``, e.g. GBrain's
+    capture/put_page, which repeats the same outcome block several times and runs to thousands
+    of tokens) into one line of the fields an agent needs. Anything else — errors, reads,
+    non-JSON text — passes through unchanged, so the option can never hide data from reads."""
+    try:
+        outer = json.loads(rendered)
+        if not isinstance(outer, dict) or set(outer) - {"result", "_meta"} or not isinstance(outer.get("result"), str):
+            return rendered
+        inner = json.loads(outer["result"])
+    except (TypeError, ValueError):
+        return rendered
+    if not isinstance(inner, dict) or "error" in inner or "request_id" not in inner:
+        return rendered
+    src = inner.get("outcome") if isinstance(inner.get("outcome"), dict) else inner
+    if "slug" not in src and "slug" not in inner:
+        return rendered
+    kept = {k: (src.get(k) if k in src else inner.get(k)) for k in _RECEIPT_KEEP if k in src or k in inner}
+    return json.dumps({"result": "saved ✅ " + json.dumps(kept, ensure_ascii=False)}, ensure_ascii=False)
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *, native_images: bool = False):
     """Sync handler (``handler(args_dict, **kwargs)``) calling an MCP tool via the background loop. Always a JSON
     string, except with ``native_images`` (the registry handler the agent loop dispatches): a result carrying
@@ -593,7 +618,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
                 server._mark_session_proven()
             image_paths.clear()
-            return _render_call_tool_result(result, server_name, image_paths)
+            rendered = _render_call_tool_result(result, server_name, image_paths)
+            if (getattr(server, "_config", None) or {}).get("compact_write_results"):
+                rendered = _compact_write_receipt(rendered)
+            return rendered
 
         def _on_failure(exc):
             _core._bump_server_error(server_name)
