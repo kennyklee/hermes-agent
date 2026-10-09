@@ -3,6 +3,8 @@ opt-in gating, and contract-valid rows."""
 
 import json
 import textwrap
+import threading
+import time
 
 import pytest
 
@@ -115,3 +117,71 @@ def test_every_gateway_adapter_platform_is_named_and_accepted_by_contract_and_sc
             assert contract.counter_dimensions_are_valid(metric, dims)
             jsonschema.validate({"name": metric, "type": "counter", "dimensions": dims, "value": 1},
                                 {"$defs": schema["$defs"], "$ref": f"#/$defs/{definition}"})
+
+
+# ---- worker teardown at gateway stop (exit residue / interpreter-finalize hygiene) ----
+
+def _metrics_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("hermes-gateway-metrics")]
+
+
+def _wait_no_metrics_thread(timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and _metrics_threads():
+        time.sleep(0.02)
+    return not _metrics_threads()
+
+
+@pytest.fixture
+def fresh_metrics_worker():
+    """Isolate the module-global metrics executor around a test and tear it down afterward."""
+    def _reset():
+        with smg._executor_lock:
+            executor, smg._executor, smg._shutdown = smg._executor, None, False
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+    _reset()
+    yield smg
+    _reset()
+
+
+def test_shutdown_flushes_queued_work_then_stops_the_worker(fresh_metrics_worker):
+    """A recording already queued ahead of the FIFO flush runs; the non-daemon worker then exits."""
+    recorded = []
+    fresh_metrics_worker._submit(recorded.append, "row")
+    assert _metrics_threads(), "a submit should have started the worker thread"
+
+    fresh_metrics_worker.shutdown()
+
+    assert recorded == ["row"], "shutdown dropped an already-queued recording"
+    assert fresh_metrics_worker._executor is None
+    assert _wait_no_metrics_thread(), "the non-daemon metrics worker survived shutdown"
+
+
+def test_submit_after_shutdown_is_dropped_not_resurrected(fresh_metrics_worker):
+    """Once stopped, a late metric is dropped rather than respawning the worker we just reaped."""
+    fresh_metrics_worker.shutdown()  # no worker started yet: just flips the flag
+
+    assert fresh_metrics_worker._submit(lambda: None) is None
+    assert fresh_metrics_worker._executor is None
+    assert not _metrics_threads(), "a post-shutdown submit resurrected the worker"
+
+
+def test_shutdown_is_idempotent_and_safe_with_no_worker(fresh_metrics_worker):
+    fresh_metrics_worker.shutdown()  # _executor is None — must not raise
+    fresh_metrics_worker.shutdown()  # idempotent
+    assert fresh_metrics_worker._executor is None
+
+
+def test_shutdown_is_bounded_when_a_recording_is_slow(fresh_metrics_worker):
+    """A wedged recording occupying the single worker must not block teardown past the flush bound."""
+    release = threading.Event()
+    try:
+        fresh_metrics_worker._submit(release.wait)  # occupies the one worker
+        started = time.monotonic()
+        fresh_metrics_worker.shutdown(flush_timeout=0.2)
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.5, f"shutdown blocked on a slow recording: {elapsed:.2f}s"
+        assert fresh_metrics_worker._executor is None
+    finally:
+        release.set()

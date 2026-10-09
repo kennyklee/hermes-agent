@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 _executor: ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
+# Set once at gateway teardown (``shutdown``): a later ``_submit`` then drops the metric instead of
+# resurrecting the worker thread we just stopped. The worker is non-daemon, so a resurrected one would
+# show up as exit residue again (and, under a clean interpreter finalize, join-block Py_FinalizeEx).
+_shutdown = False
 
 
 def _submit(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future | None:
@@ -33,12 +37,46 @@ def _submit(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future | None:
     global _executor
     try:
         with _executor_lock:
+            if _shutdown:  # torn down at gateway stop: drop the metric rather than restart the worker
+                return None
             if _executor is None:
                 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-gateway-metrics")
         return _executor.submit(contextvars.copy_context().run, _guarded, fn, *args, **kwargs)
     except Exception:  # interpreter shutdown refuses new work: the metric is simply dropped
         logger.debug("Gateway shared metric not scheduled", exc_info=True)
         return None
+
+
+def shutdown(flush_timeout: float = 0.3) -> None:
+    """Stop the metrics worker at gateway teardown so its non-daemon thread cannot linger as exit
+    residue or (under a clean interpreter finalize) join-block Py_FinalizeEx.
+
+    One bounded final flush first — a FIFO no-op future, so every recording already queued ahead of it
+    runs — then ``shutdown(wait=False, cancel_futures=True)`` drops anything still queued and lets the
+    worker exit without blocking the caller. Losing the tail of not-yet-run metrics on a restart is
+    acceptable; blocking the restart on them is not. Idempotent, best-effort, never raises into the
+    teardown path. After this, ``_submit`` drops metrics (``_shutdown``) rather than respawn the worker.
+    """
+    global _executor, _shutdown
+    with _executor_lock:
+        _shutdown = True
+        executor = _executor
+        _executor = None
+    if executor is None:
+        return
+    try:
+        future = executor.submit(lambda: None)  # FIFO: lands after everything already queued
+    except Exception:  # already shutting down / refusing work
+        future = None
+    if future is not None:
+        try:
+            future.result(timeout=max(0.0, flush_timeout))
+        except Exception:  # timed out or the flush raised — drop it, do not block teardown
+            pass
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.debug("Gateway shared-metrics executor shutdown failed", exc_info=True)
 
 
 def _guarded(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
