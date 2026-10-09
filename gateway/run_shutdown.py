@@ -270,6 +270,12 @@ class GatewayShutdownMixin:
             logger.debug("Failed marking api_server runs as shutdown-requested: %s", exc)
             return 0
 
+    # Bounded wait for a hygiene-compression worker that is already inside its watermark-fenced commit
+    # when a restart/stop begins: the commit is one SQLite transaction (archive_and_compact ->
+    # _execute_transcript_write), so a kill mid-commit is atomic either way, but we still give it a short
+    # window to finish rather than os._exit on top of it.
+    _RESTART_COMPRESSION_COMMIT_WAIT_S = 5.0
+
     def _active_deferred_agent_worker_count(self) -> int:
         """Executor workers that outlived their gateway turn (e.g. a timed-out hygiene compression)."""
         workers = getattr(self, "_deferred_agent_workers", None)
@@ -277,15 +283,32 @@ class GatewayShutdownMixin:
             return 0
         return sum(1 for future in list(workers) if not future.done())
 
-    def _track_deferred_agent_worker(self, future: asyncio.Future, agent: Any) -> None:
-        """Expose an executor worker to drain/interrupt until it really exits."""
+    def _track_deferred_agent_worker(
+        self, future: asyncio.Future, agent: Any, *, commit_fence: Any = None,
+    ) -> None:
+        """Expose an executor worker to drain/interrupt until it really exits.
+
+        ``commit_fence`` (hygiene compression only) lets the restart/stop path distinguish a convenience
+        re-summarization that may be abandoned from one inside its session-mutating commit."""
         workers = getattr(self, "_deferred_agent_workers", None)
         if workers is None:
             workers = self._deferred_agent_workers = {}
         workers[future] = agent
+        compression = getattr(self, "_deferred_compression_workers", None)
+        if commit_fence is not None:
+            if compression is None:
+                compression = self._deferred_compression_workers = {}
+            compression[future] = {
+                "fence": commit_fence, "agent": agent,
+                "session_id": getattr(agent, "session_id", None),
+                "started": time.monotonic(), "abandoned": False,
+            }
 
         def _discard_worker(done_future: asyncio.Future) -> None:
             workers.pop(done_future, None)
+            _comp = getattr(self, "_deferred_compression_workers", None)
+            if isinstance(_comp, dict):
+                _comp.pop(done_future, None)
             # Workers that outlive their starting coroutine have no later waiter: consume the
             # terminal exception so asyncio emits no unhandled-future warning.
             # See #98973.
@@ -294,6 +317,103 @@ class GatewayShutdownMixin:
                     done_future.exception()
 
         future.add_done_callback(_discard_worker)
+
+    def _live_deferred_compression_workers(self) -> list:
+        """``(future, meta)`` for each still-running tracked hygiene-compression worker."""
+        compression = getattr(self, "_deferred_compression_workers", None)
+        if not isinstance(compression, dict):
+            return []
+        return [(f, m) for f, m in list(compression.items()) if not f.done()]
+
+    def _committing_compression_count(self) -> int:
+        """Hygiene-compression workers inside their watermark-fenced commit critical section."""
+        return sum(
+            1 for _f, meta in self._live_deferred_compression_workers()
+            if getattr(meta.get("fence"), "commit_in_flight", False)
+        )
+
+    def _awaitable_deferred_agent_worker_count(self) -> int:
+        """Deferred workers the restart after-turn wait must still hold for: NON-compression workers only.
+
+        A hygiene compression worker is never held for here — it is either abandoned before its commit
+        (revoke + interrupt; the full transcript stays persisted for the next boot to re-compress) or
+        waited on for the brief commit window by ``_await_compression_commit_sections`` — so counting it
+        would reintroduce the exact 70s+ restart stall this path exists to kill (#77184 follow-up)."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        compression = getattr(self, "_deferred_compression_workers", None)
+        compression = compression if isinstance(compression, dict) else {}
+        return sum(1 for future in list(workers) if not future.done() and future not in compression)
+
+    def _drain_deferred_worker_count(self) -> int:
+        """Deferred workers the ``stop()`` drain still waits on: non-compression workers plus any
+        compression worker inside its commit critical section. Pre-commit / abandoned compression is
+        excluded — it was revoked + interrupted and must not hold the drain (mirrors the after-turn wait)."""
+        return self._awaitable_deferred_agent_worker_count() + self._committing_compression_count()
+
+    def _abandon_restart_blocking_compression(self, reason: str) -> int:
+        """Abandon in-flight hygiene compression that is NOT inside its commit critical section so a
+        restart/stop is not held for a convenience re-summarization. Idempotent.
+
+        For each such worker: revoke commit admission (so a late worker can never mutate the session
+        after we move on — the stored transcript stays full and un-compressed, and the next boot simply
+        re-runs hygiene) and hard-interrupt its agent so the summary stream unwinds instead of pinning the
+        process. A worker already inside its commit is left alone for ``_await_compression_commit_sections``.
+        Returns the number abandoned this call."""
+        from gateway.run import _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN, request_hard_interrupt
+        abandoned = 0
+        for _future, meta in self._live_deferred_compression_workers():
+            fence = meta.get("fence")
+            if meta.get("abandoned") or getattr(fence, "commit_in_flight", False):
+                continue
+            meta["abandoned"] = True
+            abandoned += 1
+            with suppress(Exception):
+                if fence is not None:
+                    fence.revoke_commit_admission()
+            agent = meta.get("agent")
+            if agent is not None:
+                try:
+                    request_hard_interrupt(agent, reason, tool_reason=_INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN)
+                except Exception as exc:
+                    logger.debug("Failed interrupting abandoned hygiene compression worker: %s", exc)
+            logger.info(
+                "Abandoning in-flight hygiene compression for %s (session=%s, elapsed=%.1fs): restart/stop "
+                "must not wait on a pre-commit summary; the stored transcript is unchanged and the next boot "
+                "will re-run hygiene",
+                "restart" if getattr(self, "_restart_requested", False) else "shutdown",
+                meta.get("session_id"), max(0.0, time.monotonic() - float(meta.get("started") or time.monotonic())),
+            )
+        return abandoned
+
+    async def _await_compression_commit_sections(self, bound: float) -> None:
+        """Wait up to ``bound`` seconds for any hygiene-compression worker already inside its
+        watermark-fenced commit to finish, so we never os._exit on top of a half-written SQLite
+        transaction. Pre-commit workers were revoked + interrupted by
+        ``_abandon_restart_blocking_compression`` and are not awaited here."""
+        if self._committing_compression_count() <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(bound))
+        logger.info(
+            "Restart/stop waiting up to %.1fs for %d hygiene compression commit(s) to finish",
+            bound, self._committing_compression_count(),
+        )
+        while loop.time() < deadline and self._committing_compression_count() > 0:
+            await asyncio.sleep(0.02)
+        remaining = self._committing_compression_count()
+        if remaining:
+            logger.warning(
+                "Restart/stop: %d hygiene compression commit(s) still in flight after %.1fs; proceeding "
+                "(the commit is one SQLite transaction, so a kill is atomic)", remaining, bound,
+            )
+
+    async def _settle_deferred_compression_for_stop(self, reason: str) -> None:
+        """Abandon pre-commit hygiene compression and briefly wait for any mid-commit worker, so a
+        restart/stop neither blocks on a convenience re-summary nor exits mid-transaction."""
+        self._abandon_restart_blocking_compression(reason)
+        await self._await_compression_commit_sections(self._RESTART_COMPRESSION_COMMIT_WAIT_S)
 
     def _interrupt_deferred_agent_workers(self, reason: str) -> int:
         """Request cancellation of detached executor-backed agent work."""
@@ -799,10 +919,13 @@ class GatewayShutdownMixin:
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred)`` — the four sources the drain waits on. The deferred term
+        excludes abandoned/pre-commit hygiene compression (``_settle_deferred_compression_for_stop``
+        revoked + interrupted it), so the drain holds only for non-compression workers and any
+        compression still inside its atomic commit."""
         return (
             self._running_agent_count(), self._active_cron_job_count(),
-            self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            self._active_api_run_count(), self._drain_deferred_worker_count(),
         )
 
     async def _drain_active_agents(
@@ -1599,7 +1722,7 @@ class GatewayShutdownMixin:
         non_cron = (
             self._running_agent_count()
             + self._active_api_run_count()
-            + self._active_deferred_agent_worker_count()
+            + self._awaitable_deferred_agent_worker_count()
         )
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
@@ -1651,6 +1774,10 @@ class GatewayShutdownMixin:
         Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
         cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
         """
+        # Hygiene compression must never hold up a restart: abandon any pre-commit summary (revoke +
+        # interrupt) and wait only the brief commit window for one already mutating the session (#77184
+        # follow-up). After this, compression no longer contributes to the awaitable count.
+        await self._settle_deferred_compression_for_stop(self._shutdown_interrupt_reason())
         active = self._active_work_count()
         if active <= 0:
             return True
@@ -1658,8 +1785,8 @@ class GatewayShutdownMixin:
             logger.warning(
                 "Restart requested with %d active work unit(s), none awaitable "
                 "(%d wedged past the inactivity timeout, %d in restart-safe external cron "
-                "workers that outlive this process); skipping the after-turn wait and "
-                "proceeding to stop()/drain", active,
+                "workers that outlive this process; abandoned hygiene compression excluded); "
+                "skipping the after-turn wait and proceeding to stop()/drain", active,
                 self._wedged_agent_count(), self._restart_safe_cron_count(),
             )
             return False
@@ -1892,6 +2019,12 @@ class GatewayShutdownMixin:
     async def _stop_drain_active_work(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Pre-mark resume_pending, drain agents/cron/API work into ``ctx``."""
         from gateway.run import GatewayRunner
+        # Same policy on the plain stop()/SIGTERM path as on the after-turn restart wait: don't drain-block
+        # on a pre-commit hygiene summary (abandon it), wait only the brief window for a mid-commit one.
+        # getattr-guard: shutdown-path tests drive this phase from bare doubles that lack the helper.
+        _settle = getattr(self, "_settle_deferred_compression_for_stop", None)
+        if callable(_settle):
+            await _settle(self._shutdown_interrupt_reason())
         # Pre-mark resume_pending BEFORE the drain so a mid-drain SIGKILL still leaves a durable marker.
         _pre_drain_keys = await GatewayRunner._mark_running_sessions_resume_pending(
             self, "pre-drain mark_resume_pending"

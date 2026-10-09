@@ -1322,7 +1322,10 @@ class GatewayTurnMixin:
             # Register the live worker with shutdown NOW, not only once it is deferred: the default
             # executor is outside self._executor's quiesce, so an untracked in-flight summary would let
             # stop() close/checkpoint state.db under its late write (mirrors run_codex_hygiene_compaction).
-            self._track_deferred_agent_worker(attempt.future, _hyg_agent)
+            # Pass the commit fence so a restart/stop can tell a pre-commit summary (abandon it — the full
+            # transcript is still persisted, next boot re-runs hygiene) from one inside its watermark-fenced
+            # commit (wait, bounded) rather than blocking the whole restart on a convenience re-summary.
+            self._track_deferred_agent_worker(attempt.future, _hyg_agent, commit_fence=_hyg_commit_fence)
             attempt.wait_started = time.monotonic()
             try:
                 _compressed = await self._hmwa_hygiene_wait_for_summary(attempt, hs, session_entry)
