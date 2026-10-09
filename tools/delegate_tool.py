@@ -396,6 +396,31 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _jev_route_task_model(task_index: int, t: Dict[str, Any], creds: Dict[str, Any], parent_agent) -> Optional[str]:
+    """Opt-in Jev model router (default off; see jev_router.py): pick a per-task Claude tier
+    from this task's full goal/context, freely up or down, when delegation pins no model (the
+    task would otherwise just inherit the parent's current model) and the effective provider is
+    Anthropic or unset. Fail-safe to whatever the caller would have used otherwise."""
+    default_model = creds.get("model") or getattr(parent_agent, "model", None)
+    if not default_model:
+        return creds.get("model")
+    provider = creds.get("provider") or getattr(parent_agent, "provider", None)
+    try:
+        from jev_router import route_delegate_task
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        return creds.get("model")
+    instructions = "\n".join(x for x in (t.get("goal"), t.get("context")) if x)
+    try:
+        return route_delegate_task(
+            task_id=str(t.get("id") or f"delegate-{task_index}"), instructions=instructions, cfg=cfg,
+            default_model=default_model, provider=provider, pinned_model=creds.get("model"),
+        )
+    except Exception:
+        return creds.get("model")
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
@@ -423,7 +448,8 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                model=_jev_route_task_model(i, t, creds, parent_agent), max_iterations=max_iterations,
+                task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:

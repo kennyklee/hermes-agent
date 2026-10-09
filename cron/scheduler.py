@@ -2606,6 +2606,20 @@ def run_job(
         jc = _load_cron_job_config(job, job_id, job_name)
         _cfg = jc.cfg
         model = jc.model
+        # Jev model router (opt-in, default off; see jev_router.py): for eligible anthropic/unset
+        # jobs with no pinned model, pick the cheapest Claude tier for this run's prompt, freely
+        # up or down. Fail-safe: any error leaves jc.model/model untouched.
+        try:
+            from jev_router import route_cron_job
+            _routed = route_cron_job(
+                job=job, cfg=_cfg, prompt=prompt, default_model=jc.model,
+                cron_default_provider=jc.cron_default_provider,
+            )
+            if _routed and _routed != jc.model:
+                jc.model = _routed
+                model = _routed
+        except Exception as exc:
+            logger.debug("jev-router: cron routing skipped for job %s: %s", job_id, exc)
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
             return setup.blocked

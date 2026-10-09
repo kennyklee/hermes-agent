@@ -179,6 +179,11 @@ class GatewaySessionCommandsMixin:
             interrupt_for_session(session_key=session_key, reason="session_reset",
                                   parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
         _reset_process_scoped_tool_state()
+        # Jev model router: /new and /reset drop any upgraded sticky tier so the next turn
+        # starts back at chat_floor instead of carrying the old conversation's tier forward.
+        with contextlib.suppress(Exception):
+            from jev_router import reset_session as _jev_reset_session
+            _jev_reset_session(session_key)
 
         new_entry = await self.async_session_store.reset_session(session_key)
         _old_sid = old_entry.session_id if old_entry else None

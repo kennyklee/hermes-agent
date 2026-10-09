@@ -1932,6 +1932,19 @@ class TurnRunner:
                 "final_response": t("gateway.errors.no_credentials"),
                 "messages": [], "api_calls": 0, "tools": [],
             }
+        # Jev model router (opt-in, default off; see jev_router.py). "upgrade_only": asks Jev
+        # before every turn and only ever moves the session's tier up, sticky for the rest of
+        # the active session. Respects /model overrides. Fail-safe: any error keeps `model`.
+        try:
+            from jev_router import route_gateway_turn
+            model = route_gateway_turn(
+                session_key=ctx.session_key, message=ctx.message, history=ctx.history,
+                cfg=ctx.user_config, default_model=model,
+                provider=runtime_kwargs.get("provider"),
+                has_model_override=runner._session_model_override(ctx.session_key) is not None,
+            )
+        except Exception as exc:
+            logger.debug("jev-router: gateway routing skipped: %s", exc)
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config

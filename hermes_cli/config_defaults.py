@@ -433,6 +433,31 @@ DEFAULT_CONFIG = {
         "cache_exempt_hosts": [],
     },
 
+    # Opt-in model routing. Default fully off; see jev_router.py.
+    "routing": {
+        # "Jev model router": ask TypeSafe Jev which Claude tier is the cheapest that will still
+        # do a task well, and run on that tier. Any error/timeout falls back to the configured
+        # default and never blocks the turn/job/task. Key: env TYPESAFE_API_KEY or file
+        # ~/.hermes/config/typesafe-api-key.
+        "jev": {
+            "enabled": False,         # master switch (default off)
+            "tiers": {                # tier name -> anthropic model id used for that tier
+                "haiku": "claude-haiku-4-5-20251001",
+                "sonnet": "claude-sonnet-5-5",
+                "opus": "claude-opus-5-5",
+            },
+            "min_confidence": 0.70,   # below this, round the pick UP one tier
+            # Gateway chat sessions only. "upgrade_only": start each session at chat_floor; before
+            # every turn ask Jev and switch up (never down) when the pick outranks the current
+            # tier. "off": gateway turns are never routed regardless of scope.
+            "chat_mode": "upgrade_only",
+            "chat_floor": "sonnet",            # tier a session starts on / resets to
+            "chat_reset_idle_minutes": 30,     # idle period after which a session resets to the floor
+            "scope": ["gateway", "cron", "delegate"],  # which surfaces honor the master switch
+            "timeout_s": 1.5,         # Jev request timeout; on timeout, use the configured default
+        },
+    },
+
     "browser": {
         # "" = Browser Use mode when the browser-use CLI (or uvx) is available, else built-in tools
         # (Camofox setups always keep built-in tools: no CDP surface); "browser-use" = force one
