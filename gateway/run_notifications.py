@@ -831,12 +831,15 @@ class GatewayNotificationsMixin:
                     "Restart notification suppressed: %s has gateway_restart_notification=false", platform_str
                 )
                 return None
-            metadata = self._pending_marker_metadata(platform, chat_id, data, transport.adapter)
+            metadata = dict(self._pending_marker_metadata(platform, chat_id, data, transport.adapter) or {})
             if data.get("delivered_via_upstream_relay") is True:
-                metadata = dict(metadata or {})
                 for field in ("user_id", "scope_id"):
                     if data.get(field):
                         metadata[field] = str(data[field])
+            # The "gateway is back" notice is the one lifecycle send the user is actively waiting on after a
+            # /restart, so it must ring: ``notify`` makes the Telegram adapter drop disable_notification even
+            # in "important" notifications mode (_notification_kwargs). Scoped to this notice only.
+            metadata["notify"] = True
             result = await transport.send(
                 platform, str(chat_id), t("gateway.startup.restarted"),
                 metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -855,6 +858,72 @@ class GatewayNotificationsMixin:
             return None
         finally:
             notify_path.unlink(missing_ok=True)
+
+    def _restart_notify_marker_target(self) -> Optional[tuple[str, Optional[str]]]:
+        """``(platform, profile)`` of the pending ``.restart_notify.json`` marker, else ``None``.
+        A peek — it does NOT consume the marker (``_send_restart_notification`` does)."""
+        from gateway.run import _hermes_home
+        notify_path = _hermes_home / ".restart_notify.json"
+        if not notify_path.exists():
+            return None
+        try:
+            data = json.loads(notify_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return None
+        platform_str = data.get("platform")
+        if not platform_str:
+            return None
+        return str(platform_str), self._marker_profile(data)
+
+    def _restart_notice_send_lock_obj(self) -> asyncio.Lock:
+        """Lazily-created lock serialising the early owner-connected send against the boot-path fallback."""
+        lock = getattr(self, "_restart_notice_send_lock", None)
+        if lock is None:
+            lock = self._restart_notice_send_lock = asyncio.Lock()
+        return lock
+
+    async def _send_restart_notification_once(self) -> Optional[tuple[str, str, Optional[str]]]:
+        """``_send_restart_notification`` guarded so the early owner-connected send and the boot-path
+        fallback cannot both fire (a double "gateway is back" push, or a double-send race while the first
+        is still mid-flight). Whichever call wins the lock first consumes the marker."""
+        if getattr(self, "_restart_notice_dispatched", False):
+            return None
+        async with self._restart_notice_send_lock_obj():
+            if getattr(self, "_restart_notice_dispatched", False):
+                return None
+            # Set before the await: _send_restart_notification unlinks the marker on every path, so a
+            # second attempt could never deliver anyway — this just blocks a concurrent double-send.
+            self._restart_notice_dispatched = True
+            return await self._send_restart_notification()
+
+    def _maybe_schedule_early_restart_notification(self) -> None:
+        """Fire the "gateway is back" notice the moment its OWNING platform+profile is connected, rather
+        than after every other platform/profile plus post-connect wiring settles (production: the owner
+        connected ~5s before the notice went out). Best-effort and idempotent; if the owner is not up yet
+        the marker is left untouched for the boot-path fallback / reconnect replay, so it is never lost."""
+        if getattr(self, "_restart_notice_dispatched", False):
+            return
+        target = self._restart_notify_marker_target()
+        if target is None:
+            return
+        # Capture the one-shot "booted from a chat /restart" signal BEFORE the send can unlink the marker;
+        # _start_finish_wiring would otherwise read a marker this early send already consumed.
+        self._booted_from_restart = True
+        platform_str, profile = target
+        try:
+            platform = Platform(platform_str)
+        except (ValueError, KeyError):
+            return
+        from gateway.delivery import resolve_delivery_transport
+        if resolve_delivery_transport(platform, self.config, self._adapters_for_profile(profile)) is None:
+            return  # owner transport not up yet → leave the marker for the boot-path fallback
+        task = asyncio.ensure_future(self._send_restart_notification_once())
+        retain = getattr(self, "_retain_background_task", None)
+        if callable(retain):
+            retain(task)
+        late_cb = getattr(self, "_late_failure_callback", None)
+        if callable(late_cb):
+            task.add_done_callback(late_cb("early restart notification send failed"))
 
     def _home_channel_transports(self):
         """Yield ``(platform, platform_cfg, home, transport)`` for every home channel with a live transport."""
