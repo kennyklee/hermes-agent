@@ -295,7 +295,9 @@ class GatewayStartupMixin:
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
-            await self._send_restart_notification()
+            # Fallback to the early owner-connected send (_maybe_schedule_early_restart_notification): a
+            # no-op if that already dispatched, the real send if the owner connected late or not at all.
+            await self._send_restart_notification_once()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)
@@ -1644,6 +1646,10 @@ class GatewayStartupMixin:
         connected_count = await self._start_aggregate_connect_results(
             _raw, startup_retryable_errors, startup_nonretryable_errors
         )
+        # Send the "gateway is back" notice the instant its owning platform connects, before secondary
+        # profiles, the settle sleep and post-connect wiring. Owner-not-up-yet falls through to the
+        # post-secondary attempt and finally the boot-path fallback, so the notice is never lost.
+        self._maybe_schedule_early_restart_notification()
         if await self._abort_startup_if_shutdown_requested():
             return True
         _aborted, connected_count = await self._start_secondary_profiles(
@@ -1651,6 +1657,8 @@ class GatewayStartupMixin:
         )
         if _aborted:
             return True
+        # Second chance for a marker owned by a secondary profile that just connected above.
+        self._maybe_schedule_early_restart_notification()
         if self._start_handle_no_connections(
             connected_count, enabled_platform_count, startup_retryable_errors, startup_nonretryable_errors
         ):

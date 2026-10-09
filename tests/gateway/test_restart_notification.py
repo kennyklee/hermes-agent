@@ -1,5 +1,6 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -318,6 +319,60 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     assert not notify_path.exists()
 
 
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_requests_a_push(tmp_path, monkeypatch):
+    """The "gateway is back" notice carries ``notify`` so Telegram's "important" mode still rings it."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+
+    runner, adapter = make_restart_runner()
+
+    result = await runner._send_restart_notification()
+
+    assert result == ("telegram", "42", None)
+    assert adapter.sent_calls[-1][2]["notify"] is True
+
+
+@pytest.mark.asyncio
+async def test_early_restart_notification_sends_once_owner_connected(tmp_path, monkeypatch):
+    """The notice goes out the moment its owning platform is connected, before the rest of startup."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({"platform": "telegram", "chat_id": "42"}))
+
+    runner, adapter = make_restart_runner()
+
+    runner._maybe_schedule_early_restart_notification()
+    # The one-shot "booted from a chat /restart" signal is captured before the send consumes the marker.
+    assert runner._booted_from_restart is True
+    await asyncio.gather(*list(runner._background_tasks))
+
+    assert not notify_path.exists()  # consumed by the early send
+    assert adapter.sent_calls and adapter.sent_calls[-1][2]["notify"] is True
+    # The boot-path fallback is now a no-op — no double "gateway is back" push.
+    assert await runner._send_restart_notification_once() is None
+
+
+@pytest.mark.asyncio
+async def test_early_restart_notification_defers_when_owner_not_connected(tmp_path, monkeypatch):
+    """A marker owned by a platform that is not up yet is left for the boot-path fallback, not lost."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({"platform": "slack", "chat_id": "D1"}))
+
+    runner, _adapter = make_restart_runner()  # only telegram is connected
+
+    runner._maybe_schedule_early_restart_notification()
+
+    assert not runner._background_tasks  # nothing scheduled
+    assert notify_path.exists()  # marker preserved for the fallback
+    assert getattr(runner, "_restart_notice_dispatched", False) is False
+    # We still know we booted from a restart, independent of whether the notice has gone out.
+    assert runner._booted_from_restart is True
 
 
 @pytest.mark.asyncio
