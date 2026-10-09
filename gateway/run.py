@@ -4923,8 +4923,15 @@ _MCP_CHILD_TREE_REAP_GRACE = 0.5
 # Cap on how long the shutdown tail waits for the GRACEFUL MCP close before force-reaping. The
 # force-reap below SIGTERM/SIGKILLs and unregisters EVERY tracked tree unconditionally, so this is
 # only "how long to let servers close cleanly first"; a wedged close that would otherwise burn the
-# old 5.0s default is bounded here and the trees still die. Normal closes finish well inside 2.0s.
-_MCP_SHUTDOWN_DRAIN_TIMEOUT = 2.0
+# old 5.0s default is bounded here and the trees still die. This budget carries NO data-safety
+# obligation: the gateway's own durable state (SessionDB close/checkpoint, transcript flush, status
+# persist) is written in _stop_impl BEFORE "Gateway stopped" — an MCP server is an external tool
+# transport with no Hermes-side data to lose, and it is respawned by the next gateway. The exit-tail
+# instrumentation showed this await dominating the post-"Gateway stopped" gap (it sat near its full
+# budget: wedged/slow SDK transport closes abandoned on timeout). Normal closes finish well inside
+# 1.0s, so 1.0s still lets a cooperative server close cleanly while halving the penalty a wedged one
+# adds to the restart. Lowered 2.0s -> 1.0s (#53107 lineage).
+_MCP_SHUTDOWN_DRAIN_TIMEOUT = 1.0
 
 
 async def _await_thread_exit(
@@ -5834,50 +5841,80 @@ async def _start_gateway_shutdown_tail(
     cron_thread: Any, housekeeping_thread: threading.Thread,
     _planned_stop_watcher_stop: threading.Event, _planned_stop_watcher_thread: threading.Thread,
     _signal_initiated_shutdown: list) -> bool:
-    """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
-    # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
-    # successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook instead.
-    if _control_server is not None:
+    """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0).
+
+    This is the window between "Gateway stopped (total teardown …)" and the event loop
+    returning/raising ``SystemExit`` — the ~2s the restart path spends AFTER the data-safe teardown
+    (SessionDB close, transcript flush, status persist) already finished in ``_stop_impl``. Every
+    remaining await here is timed and the per-phase breakdown is logged at INFO and written to
+    ``gateway-exit-diag.log`` (``gateway.exit_tail_timing``), so a future regression in this gap is
+    diagnosable from logs instead of a live bisect."""
+    tail_started = time.monotonic()
+    timings: dict[str, float] = {}
+
+    async def _phase(label: str, awaitable):
+        t0 = time.monotonic()
         try:
-            await _control_server.stop()
-        except Exception:
-            logger.debug("Control socket stop failed (non-fatal)", exc_info=True)
+            return await awaitable
+        finally:
+            timings[label] = round(time.monotonic() - t0, 4)
+            logger.info("Shutdown tail: %s done at +%.3fs (took %.3fs)",
+                        label, time.monotonic() - tail_started, timings[label])
 
-    def _stop_keepalive() -> None:
-        from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
-        stop_nous_auth_keepalive()
-
-    _best_effort(_stop_keepalive)
-
-    # Never join(): an in-flight cron delivery is a coroutine on THIS loop; a sync join would drop it.
-    # Stop cron scheduler + housekeeping cleanly. These MUST be awaited cooperatively, not join()ed. A cron
-    # delivery in flight when the gateway restarts is a coroutine scheduled onto THIS event loop
-    # (safe_schedule_threadsafe); the ticker thread is blocked on its future.result(). A synchronous
-    # cron_thread.join() would block the loop, so that delivery could never run — it timed out and the
-    # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
-    # finishes before we tear down.
-    cron_stop.set()
-    _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
-        logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
-                       "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
-    await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
-
-    # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
-    _planned_stop_watcher_stop.set()
-    _planned_stop_watcher_thread.join(timeout=2)
-
-    # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
-    # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
     try:
-        await _shutdown_mcp_servers_nonblocking(
-            timeout=_MCP_SHUTDOWN_DRAIN_TIMEOUT, config=getattr(runner, "config", None))
-    except Exception:
-        logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+        # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer
+        # and a successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook.
+        if _control_server is not None:
+            try:
+                await _phase("control_socket_stop", _control_server.stop())
+            except Exception:
+                logger.debug("Control socket stop failed (non-fatal)", exc_info=True)
 
-    # The failure verdict comes AFTER the cooperative teardown: returning early here leaked the
-    # cron ticker + housekeeping threads (and open MCP connections) for embedded callers (#12175).
-    return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
+        def _stop_keepalive() -> None:
+            from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
+            stop_nous_auth_keepalive()
+
+        _ka0 = time.monotonic()
+        _best_effort(_stop_keepalive)
+        timings["keepalive_stop"] = round(time.monotonic() - _ka0, 4)
+
+        # Never join(): an in-flight cron delivery is a coroutine on THIS loop; a sync join would drop
+        # it. Stop cron scheduler + housekeeping cleanly. These MUST be awaited cooperatively, not
+        # join()ed. A cron delivery in flight when the gateway restarts is a coroutine scheduled onto
+        # THIS event loop (safe_schedule_threadsafe); the ticker thread is blocked on its
+        # future.result(). A synchronous cron_thread.join() would block the loop, so that delivery
+        # could never run — it timed out and the message was silently dropped (#58818). Awaiting keeps
+        # the loop alive so the in-flight delivery finishes before we tear down.
+        cron_stop.set()
+        _stop_cron_provider(cron_provider)
+        if not await _phase("cron_ticker_drain",
+                            _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT)):
+            logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+                           "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
+        await _phase("housekeeping_drain",
+                     _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT))
+
+        # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+        _planned_stop_watcher_stop.set()
+        _pw0 = time.monotonic()
+        _planned_stop_watcher_thread.join(timeout=2)
+        timings["planned_watcher_join"] = round(time.monotonic() - _pw0, 4)
+
+        # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
+        # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
+        try:
+            await _phase("mcp_shutdown", _shutdown_mcp_servers_nonblocking(
+                timeout=_MCP_SHUTDOWN_DRAIN_TIMEOUT, config=getattr(runner, "config", None)))
+        except Exception:
+            logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+
+        # The failure verdict comes AFTER the cooperative teardown: returning early here leaked the
+        # cron ticker + housekeeping threads (and open MCP connections) for embedded callers (#12175).
+        return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
+    finally:
+        # Emitted in a finally so the record lands even though _resolve_gateway_exit_verdict raises
+        # SystemExit on the restart/planned-stop paths.
+        _record_exit_tail_timing(timings, round(time.monotonic() - tail_started, 4))
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
@@ -6131,11 +6168,16 @@ def _finalize_gateway_loop(loop: "asyncio.AbstractEventLoop",
         return
     if not tasks:
         return
+    started = time.monotonic()
+    count = len(tasks)
     for task in tasks:
         task.cancel()
     with suppress(Exception):
         loop.run_until_complete(
             asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout))
+    # This sweep runs AFTER the shutdown tail, in _run_gateway_event_loop's finally; record it on the
+    # same durable sink so the full "Gateway stopped" → loop-exit budget is reconstructable from logs.
+    _record_loop_finalize_timing(count, round(time.monotonic() - started, 4))
 
 
 def _run_gateway_event_loop(coro):
@@ -6291,6 +6333,40 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         _best_effort(_step)
     _best_effort(lambda: _log_exit_residue(exit_code))
     os._exit(exit_code)
+
+
+def _append_exit_timing_record(tag: str, payload: dict) -> None:
+    """Append a timing record to gateway-exit-diag.log (same durable sink as gateway.exit_residue and
+    the CLI's _exit_diag). Best-effort; never raises into the teardown path."""
+    with suppress(Exception):
+        from datetime import datetime, timezone
+        from gateway.lifecycle_ledger import _append_exit_diag
+        _append_exit_diag({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "tag": tag,
+            "pid": os.getpid(),
+            **payload,
+        }, None)
+
+
+def _record_exit_tail_timing(phase_timings: dict, total_s: float) -> None:
+    """INFO + durable record of the per-phase cost of the post-'Gateway stopped' shutdown tail (the
+    window between 'Gateway stopped' and the event loop returning/raising SystemExit on the restart
+    path). Names the dominant phase so a future regression is obvious at a glance."""
+    dominant = max(phase_timings.items(), key=lambda kv: kv[1], default=("none", 0.0))
+    logger.info("Shutdown tail complete in %.3fs (phases=%s; dominant=%s@%.3fs)",
+                total_s, phase_timings, dominant[0], dominant[1])
+    _append_exit_timing_record("gateway.exit_tail_timing", {
+        "total_s": total_s, "dominant": dominant[0], "phases_s": phase_timings})
+
+
+def _record_loop_finalize_timing(task_count: int, elapsed_s: float) -> None:
+    """INFO + durable record of the leftover-task cancellation sweep in _finalize_gateway_loop, which
+    runs after the shutdown tail. Only emitted when there were tasks to cancel (silent on the common
+    no-leftover path, matching _log_exit_residue)."""
+    logger.info("Loop finalize cancelled %d leftover task(s) in %.3fs", task_count, elapsed_s)
+    _append_exit_timing_record("gateway.loop_finalize_timing", {
+        "task_count": task_count, "elapsed_s": elapsed_s})
 
 
 def _live_nondaemon_threads() -> list:
