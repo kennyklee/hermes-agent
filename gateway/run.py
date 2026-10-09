@@ -6266,6 +6266,13 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         remove_pid_file()
         release_gateway_runtime_lock()
 
+    def _stop_shared_metrics() -> None:
+        # Stop the gateway/cron shared-metrics worker (non-daemon "hermes-gateway-metrics" thread) with a
+        # bounded final flush, so it is not left as exit residue and cannot (under a clean finalize) block
+        # Py_FinalizeEx. Runs before _log_exit_residue so the snapshot is clean; idempotent.
+        from hermes_cli.observability.shared_metrics_gateway import shutdown as shutdown_gateway_metrics
+        shutdown_gateway_metrics()
+
     def _mark_exited() -> None:
         # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
         # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
@@ -6280,7 +6287,7 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _stop_shared_metrics, _mark_exited, _drain_logs):
         _best_effort(_step)
     _best_effort(lambda: _log_exit_residue(exit_code))
     os._exit(exit_code)
