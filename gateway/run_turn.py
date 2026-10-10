@@ -1519,12 +1519,18 @@ class GatewayTurnMixin:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
+        # Local peer-silence policy: a bot handoff may decline (marker or "(empty)") even when tagged,
+        # so peer replies never turn control tokens into warning loops.
+        _empty_sentinel = isinstance(response, str) and response.strip() == "(empty)"
+        _peer_turn = bool(getattr(source, "is_bot", False))
+        if _peer_turn and not agent_result.get("failed") and (_empty_sentinel or _intentional_silence):
+            _intentional_silence = True
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        if _intentional_silence and not _peer_turn and not silence_allowed(_silence_kind, _silence_reply_expected):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -1540,7 +1546,9 @@ class GatewayTurnMixin:
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
         # reads the same words on every surface.
-        if response == "(empty)" and not _intentional_silence:
+        if _intentional_silence and _empty_sentinel:
+            response = ""
+        if response.strip() == "(empty)" and not _intentional_silence:
             from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
 
             _model = str(agent_result.get("model") or "").strip() or t("gateway.errors.empty_response_model_label")

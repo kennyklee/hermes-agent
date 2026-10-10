@@ -142,6 +142,9 @@ def is_partial_silence_marker(text: Any) -> bool:
     is held back so a raw marker is never shown and then retracted.  Divergence
     from every marker, or exceeding the cap, resumes normal streaming.
     """
+    # Hold the internal empty sentinel too; the completed turn decides silence vs a real error.
+    if isinstance(text, str) and text.strip() and "(empty)".startswith(text.strip()):
+        return True
     return any(
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
         for c in _canonical_silence_candidates(text)
