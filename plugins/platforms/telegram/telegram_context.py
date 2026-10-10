@@ -12,8 +12,22 @@ if TYPE_CHECKING:
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
+_AUTOMATED_WARNING_PREFIXES = (
+    "⚠️ The model returned a silence marker",
+    "⚠️ The model returned no response after processing tool results.",
+    "⚠️ Processing completed but no response was generated.",
+)
+
+
 def mentions_only_peer_suppressed(adapter: "TelegramAdapter", message: "Message") -> bool:
     """Mentions-only peers cannot wake via reply chains or leak status noise into context."""
+    if adapter._sender_is_other_bot(message):
+        # These are gateway diagnostics, not fresh handoff requests. Restrict to
+        # bot-origin warning prefixes; humans can still quote/report the errors.
+        for text in (getattr(message, "text", None), getattr(message, "caption", None)):
+            cleaned = (adapter._clean_bot_trigger_text(text) or "").strip()
+            if cleaned.startswith(_AUTOMATED_WARNING_PREFIXES):
+                return True
     mode = extra_or_secret(adapter.config.extra, "allow_bots", "TELEGRAM_ALLOW_BOTS", "none")
     return (
         str(mode).lower().strip() == "mentions"

@@ -1,5 +1,6 @@
 """Peer replies must not turn intentional silence into a bot warning loop."""
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -32,6 +33,37 @@ def test_mentions_mode_requires_current_peer_address(monkeypatch, scope, require
     assert adapter._should_process_message(msg)
 
 
+def test_unmentioned_peer_is_not_observed_but_human_is():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"],
+                            group_allowed_chats=["-100"],
+                            observe_unmentioned_group_messages=True)
+    adapter.config.extra["allow_bots"] = "mentions"
+    msg = _group_message("plain chatter")
+    msg.from_user.is_bot = True
+    assert not adapter._should_observe_unmentioned_group_message(msg)
+    msg.from_user.is_bot = False
+    assert adapter._should_observe_unmentioned_group_message(msg)
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_peer_stops_before_dispatch_and_reactions():
+    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"],
+                            observe_unmentioned_group_messages=True)
+    adapter.config.extra["allow_bots"] = "mentions"
+    adapter._enqueue_text_event = Mock()
+    adapter._observe_unmentioned_group_message = Mock()
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._cache_replied_media = AsyncMock()
+    adapter.on_processing_start = AsyncMock()
+    msg = _group_message("NO_REPLY", reply_to_bot=True)
+    msg.from_user.is_bot = True
+    await adapter._handle_text_message(SimpleNamespace(message=msg, update_id=1), None)
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._observe_unmentioned_group_message.assert_not_called()
+    adapter.on_processing_start.assert_not_awaited()
+    adapter._ensure_forum_commands.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_bot,address,expected", [
     (True, "reply", False), (True, "plain", False), (True, "mention", False),
@@ -58,10 +90,73 @@ async def test_telegram_addressing_reaches_gateway_silence_policy(monkeypatch, t
     })
     response = await runner._handle_message_with_agent(
         event, event.source, "agent:main:telegram:group:-1001:12345", 1)
-    # Only intentional silence on an unaddressed turn is suppressed. Actual empty
-    # model failures and directed human requests retain the visible fallback.
-    if final == "[SILENT]" and expected is False:
+    # Only intentional silence on an unaddressed turn is suppressed. A bot peer's turn
+    # never earns the visible failure fallback either way, to avoid a warning loop.
+    # Actual empty model failures and directed human requests retain the fallback.
+    if is_bot or (final == "[SILENT]" and expected is False):
         assert response == ""
     else:
-        assert response and response != "[SILENT]"
+        assert response and response.strip() not in {"[SILENT]", "(empty)"}
     assert event.reply_expected is expected
+
+
+@pytest.mark.parametrize("mode", ["mentions", "all"])
+@pytest.mark.parametrize("warning", [
+    "⚠️ The model returned a silence marker instead of a response.",
+    "⚠️ The model returned no response after processing tool results. Try again.",
+    "⚠️ Processing completed but no response was generated. Try again.",
+])
+def test_tagged_automated_warning_cannot_restart_peer_loop(mode, warning):
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"],
+                            group_allowed_chats=["-100"],
+                            observe_unmentioned_group_messages=True)
+    adapter.config.extra["allow_bots"] = mode
+    msg = _group_message("@hermes_bot " + warning, reply_to_bot=True)
+    msg.from_user.is_bot = True
+    assert not adapter._should_process_message(msg)
+    assert not adapter._should_observe_unmentioned_group_message(msg)
+    msg.from_user.is_bot = False
+    assert adapter._should_process_message(msg)  # humans can report the warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final", ["[SILENT]", "NO_REPLY", "(empty)", "  (empty)\n"])
+async def test_tagged_bot_handoff_can_intentionally_stay_silent(monkeypatch, tmp_path, final):
+    adapter = _make_adapter(require_mention=True, bot_username="HenryHermesAi_bot")
+    adapter.config.extra["allow_bots"] = "mentions"
+    msg = _group_message("@HenryHermesAi_bot HANDOFF-CHECK Mac")
+    msg.from_user.is_bot = True
+    assert adapter._should_process_message(msg)
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": final, "messages": [], "tools": [],
+        "api_calls": 1, "failed": False,
+    })
+    response = await runner._handle_message_with_agent(
+        event, event.source, "agent:main:telegram:group:-1001:12345", 1)
+    assert response == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_bot", [False, True])
+@pytest.mark.parametrize("final,failed", [
+    ("", True), ("(empty)", True), ("NO_REPLY", True),
+    ("The directory is (empty), so no files were changed.", False),
+])
+async def test_failure_and_substantive_empty_prose_are_preserved(monkeypatch, tmp_path, is_bot, final, failed):
+    adapter = _make_adapter()
+    msg = _group_message("@hermes_bot check")
+    msg.from_user.is_bot = is_bot
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": final, "messages": [], "tools": [],
+        "api_calls": 1, "failed": failed, "error": "upstream unavailable",
+    })
+    response = await runner._handle_message_with_agent(
+        event, event.source, "agent:main:telegram:group:-1001:12345", 1)
+    if failed:
+        assert response  # upstream wording differs; a failed turn is never silent
+    else:
+        assert response == final

@@ -567,7 +567,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
-                    if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
+                    _final_display = self._clean_for_display(self._accumulated)
+                    if _is_intentional_silence_response(_final_display) or _final_display.strip() == "(empty)":
                         await self._suppress_silence_marker()
                         return
 
