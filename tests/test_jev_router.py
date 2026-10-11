@@ -80,8 +80,17 @@ def test_apply_round_up():
     # At/above threshold keeps the pick.
     assert jev_router._apply_round_up("haiku", 0.70, 0.70) == ("haiku", False)
     assert jev_router._apply_round_up("sonnet", 0.99, 0.70) == ("sonnet", False)
-    # opus is the ceiling -- never rounds past it.
+    # opus is the round-up ceiling -- low confidence never escalates to fable.
     assert jev_router._apply_round_up("opus", 0.10, 0.70) == ("opus", False)
+    # an explicit fable pick is kept, whatever the confidence.
+    assert jev_router._apply_round_up("fable", 0.10, 0.70) == ("fable", False)
+
+
+def test_fable_is_top_tier_and_partial_config_tiers_merge_defaults():
+    assert jev_router._tier_rank("opus") < jev_router._tier_rank("fable")
+    cfg = jev_router._read_config({"routing": {"jev": {"enabled": True, "tiers": {"haiku": "h-x"}}}})
+    assert cfg.tiers["haiku"] == "h-x"
+    assert cfg.tiers["fable"] == "claude-fable-5-1"
 
 
 def test_decide_rounds_up_low_confidence(monkeypatch):
@@ -461,7 +470,7 @@ def test_read_config_defaults_when_missing():
     assert jev.chat_floor == "sonnet"
     assert jev.chat_reset_idle_minutes == 30
     assert jev.scope == ["gateway", "cron", "delegate"]
-    assert jev.tiers["haiku"] == "claude-haiku-4-5-20251001"
+    assert jev.tiers["haiku"] == "claude-haiku-5-5"
 
 
 def test_read_config_rejects_invalid_chat_mode_and_floor():

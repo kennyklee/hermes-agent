@@ -43,15 +43,19 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://api.typesafe.ai/v1/systemone"
 _TIMEOUT_S = 1.5
-_TIER_ORDER = ("haiku", "sonnet", "opus")
+_TIER_ORDER = ("haiku", "sonnet", "opus", "fable")
+# Low-confidence picks round up one tier but never past this one: fable (2.5x opus price)
+# is used only when Jev picks it outright.
+_ROUND_UP_CEILING = "opus"
 
 # Provider strings that mean "Anthropic / Claude" (unset also counts as eligible).
 _ANTHROPIC_ALIASES = {"anthropic", "claude", "claude-oauth", "claude-code"}
 
 _DEFAULT_TIERS = {
-    "haiku": "claude-haiku-4-5-20251001",
+    "haiku": "claude-haiku-5-5",
     "sonnet": "claude-sonnet-5-5",
     "opus": "claude-opus-5-5",
+    "fable": "claude-fable-5-1",
 }
 
 # Reused verbatim from the jev-model-picker.py prototype (do not reword -- it is tuned).
@@ -65,6 +69,9 @@ _QUESTION = {
                    "not_for": "Hard debugging, architecture, high-stakes strategy or negotiation, long autonomous coding."},
         "opus": {"covers": "Hard reasoning: debugging complex systems, multi-file code changes, architecture and upgrade risk reviews, high-stakes strategy, investor or partner negotiation drafts, ambiguous problems with many trade-offs.",
                  "not_for": "Routine or simple tasks."},
+
+        "fable": {"covers": "The very hardest problems: PhD-level math or science proofs, novel research questions, long-horizon planning where one wrong early decision is very costly, and problems a strong model has already failed at.",
+                  "not_for": "Anything Opus-level reasoning handles well, including most debugging, coding, strategy and drafting."},
     },
 }
 
@@ -124,7 +131,7 @@ def _read_config(cfg: Optional[dict]) -> JevConfig:
         chat_mode = "upgrade_only"
     return JevConfig(
         enabled=bool(r.get("enabled", False)),
-        tiers=dict(tiers) if isinstance(tiers, dict) and tiers else dict(_DEFAULT_TIERS),
+        tiers={**_DEFAULT_TIERS, **tiers} if isinstance(tiers, dict) else dict(_DEFAULT_TIERS),
         min_confidence=min_conf,
         chat_mode=chat_mode,
         chat_floor=chat_floor,
@@ -184,10 +191,10 @@ def delegate_eligible(pinned_model: Optional[str], provider: Optional[str]) -> b
 
 
 def _apply_round_up(tier: str, confidence: float, min_confidence: float) -> tuple[str, bool]:
-    """Below ``min_confidence`` the pick is rounded UP one tier (never past opus)."""
+    """Below ``min_confidence`` the pick is rounded UP one tier (never past ``_ROUND_UP_CEILING``)."""
     if tier in _TIER_ORDER and confidence < min_confidence:
         idx = _TIER_ORDER.index(tier)
-        if idx < len(_TIER_ORDER) - 1:
+        if idx < _TIER_ORDER.index(_ROUND_UP_CEILING):
             return _TIER_ORDER[idx + 1], True
     return tier, False
 
